@@ -91,19 +91,114 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class SparseTop2MLP(nn.Module):
+    '''This part is from huggingface transformers' implementation of Mixtral 8x7b.'''
+
+    def __init__(self, config):
+        super().__init__()
+        self.ffn_dim = config.intermediate_size
+        self.n_embd = config.n_embd
+
+        self.w1 = nn.Linear(self.n_embd, self.ffn_dim, bias=False)
+        self.w2 = nn.Linear(self.ffn_dim, self.n_embd, bias=False)
+        self.w3 = nn.Linear(self.n_embd, self.ffn_dim, bias=False)
+
+        self.act_fn = nn.GELU()
+
+    def forward(self, hidden_states):
+        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
+        current_hidden_states = self.w2(current_hidden_states)
+        return current_hidden_states
+
+class SparseMoeBlock(nn.Module):
+    """
+    This part is from huggingface transformers' implementation of Mixtral 8x7b. 
+    This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accomodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+
+        # gating
+        self.gate = nn.Linear(self.n_embd, self.num_experts, bias=False)
+
+        self.experts = nn.ModuleList([SparseTop2MLP(config) for _ in range(self.num_experts)])
+
+        # Jitter parameters
+        self.jitter_noise = config.router_jitter_noise
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
+        batch_size, sequence_length, n_embd = hidden_states.shape
+        if self.training and self.jitter_noise > 0:
+            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        hidden_states = hidden_states.view(-1, n_embd)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, n_embd), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # One hot encode the selected experts to create an expert mask
+        # this will be used to easily index which expert is going to be sollicitated
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+
+        # Loop over all available experts in the model and perform the computation on each expert
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            # Index the correct hidden states and compute the expert hidden state for
+            # the current expert. We need to make sure to multiply the output hidden
+            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+            current_state = hidden_states[None, top_x].reshape(-1, n_embd)
+            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+
+            # However `index_add_` only support torch tensors for indexing so we'll use
+            # the `top_x` tensor here.
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, n_embd)
+        return final_hidden_states, selected_experts #router_logits the original code returns router logits but i think selected experts is more interesting
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn1 = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.moe = SparseMoeBlock(config)
+        self.ln_3 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn2 = CausalSelfAttention(config)
+        self.ln_4 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        x = x + self.attn1(self.ln_1(x))
+        y, selected_experts = self.moe(self.ln_2(x))
+        x = x + y
+        x = x + self.attn2(self.ln_3(x))
+        x = x + self.mlp(self.ln_4(x))
+        return x, selected_experts
+
 
 @dataclass
 class GPTConfig:
@@ -114,6 +209,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    intermediate_size: int = 4 * n_embd
+    num_local_experts: int = 8
+    num_experts_per_tok: int = 2
+    router_jitter_noise: float = 0.0
+
 
 class GPT(nn.Module):
 
@@ -127,7 +227,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer//2)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -178,7 +278,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x,selected_experts= block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -190,7 +290,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, selected_experts
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -313,7 +413,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

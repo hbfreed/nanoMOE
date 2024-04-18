@@ -23,6 +23,12 @@ n_layer = 6
 n_head = 6
 n_embd = 384
 dropout = 0.2
+intermediate_size = 4 * n_embd
+num_local_experts = 8
+num_experts_per_tok = 2
+router_jitter_noise = 0.0
+bias = False
+
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000

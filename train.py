@@ -32,6 +32,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+torch.manual_seed(1337)
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -54,6 +55,12 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+intermediate_size = 4 * n_embd
+num_local_experts = 8
+num_experts_per_tok = 2
+router_jitter_noise = 0.0
+bias = False
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -145,7 +152,9 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout,intermediate_size=intermediate_size,
+                  num_local_experts=num_local_experts,num_experts_per_tok=num_experts_per_tok,
+                  router_jitter_noise=router_jitter_noise) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -211,6 +220,17 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+def count_experts(all_selected_experts):
+    # count the number of times each expert was selected
+    expert_counts = {}
+    for selected_experts in all_selected_experts:
+        for expert in selected_experts:
+            if expert not in expert_counts:
+                expert_counts[expert] = 0
+            expert_counts[expert] += 1
+    return expert_counts
+
+
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
 def estimate_loss():
@@ -221,7 +241,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss, _ = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -252,6 +272,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+selected_experts_tracking = []
 while True:
 
     # determine and set the learning rate for this iteration
@@ -261,7 +282,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses= estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -297,8 +318,9 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, selected_experts = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        selected_experts_tracking.append(selected_experts[1].tolist())
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -324,7 +346,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, selected expert(s):{dict(sorted(count_experts(selected_experts_tracking).items()))}")
     iter_num += 1
     local_iter_num += 1
 
