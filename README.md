@@ -1,3 +1,89 @@
+# nanoMoE
+Adding support for Mixture of Experts (MoE) models. 
+For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.02060). 
+
+![nanoMoE](assets/nanomoe.png)
+## Goals
+- [ ] Train an MoE nanoGPT on shakespeare_char
+    - [ ] Val loss < 1.467 for ~10M active parameters
+    - [ ] Val loss ~= 1.467 for <10M active parameters
+- [ ] Must not use [for loops over the experts](https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L598C1-L598C51)
+    - [ ] Vanilla PyTorch version
+    - [ ] Triton kernel version
+    - [ ] Megablocks version?
+- [ ] Train GPT-2 Size MoE on OWT/Fineweb (Stretch Goal if feeling frisky, probably would have to be ~125m *total*, would have to see how efficient we can really get to do ~125m active!)
+
+## Architecture Decisions
+
+### Routing Strategy
+- **Router Type**: Top-k routing (k=2 following OLMoE)
+- **Router Architecture**: Single linear layer per MoE block
+- **Normalization**: Layer norm before router (following OLMoE's approach)
+- **Auxiliary losses**: 
+  - Load balancing loss (coefficient ~0.01)
+  - Router z-loss for stability (coefficient ~0.001)
+
+### Expert Configuration
+- **Expert granularity**: Replace FFN layers with MoE blocks
+- **Expert capacity**: 8 experts per layer (OLMoE uses 64, but for nano we can start smaller)
+- **Active experts**: Top-2 routing
+- **Expert architecture**: Standard FFN (up projection → activation → down projection)
+
+### Efficient Batching Strategy
+- **Grouped dispatch**: Batch tokens by selected experts to avoid loops
+- **Capacity factor**: 1.25x to handle load imbalance
+- **Dropout**: Expert dropout during training (drop entire experts with p=0.1)
+
+## Ablation Studies (Controlling for Active Parameters)
+
+### 10M Active Parameter Studies
+| Config Name | Total Params | Active Params | Multiplier | Experts | Top-k | Notes |
+|-------------|--------------|---------------|------------|---------|-------|--------|
+| Dense-10M   | 10M          | 10M           | 1x         | 1       | 1     | Baseline |
+| MoE-4x2     | 20M          | 10M           | 2x         | 4       | 2     | |
+| MoE-8x2     | 40M          | 10M           | 4x         | 8       | 2     | OLMoE multiplier|
+| MoE-16x1    | 80M          | 10M           | 8x         | 16      | 2     | |
+
+### 50M Active Parameter Studies
+| Config Name | Total Params | Active Params | Multiplier | Experts | Top-k | Notes |
+|-------------|--------------|---------------|------------|---------|-------|--------|
+| Dense-50M   | 50M          | 50M           | 1x         | 1       | 1     | Baseline |
+| MoE-4x2     | 100M         | 50M           | 2x         | 4       | 2     | |
+| MoE-8x2     | 200M         | 50M           | 4x         | 8       | 2     | |
+| MoE-8x4     | 200M         | 50M           | 4x         | 8       | 4     | Higher k |
+| MoE-16x2    | 400M         | 50M           | 8x         | 16      | 2     | |
+| MoE-32x1    | 800M         | 50M           | 16x        | 32      | 2     | Extreme sparsity |
+
+## TODO
+
+### Implementation
+- [ ] Implement basic MoE layer with top-k routing
+- [ ] Add auxiliary losses (load balancing + router z-loss)
+- [ ] Implement expert capacity limits and overflow handling
+- [ ] Add grouped token dispatch (no loops!)
+- [ ] Implement expert dropout
+- [ ] Add router temperature scaling
+- [ ] Implement different routing strategies (could compare top-k vs expert choice)
+
+### Optimization
+- [ ] Profile memory usage vs dense model
+- [ ] Implement gradient checkpointing for MoE layers
+- [ ] Add mixed precision support
+- [ ] Benchmark routing overhead
+- [ ] Compare communication patterns for different expert layouts
+
+### Validation
+- [ ] Track per-expert utilization
+- [ ] Monitor routing entropy
+- [ ] Visualize routing patterns over training
+- [ ] Compare active parameters vs total parameters
+- [ ] Ablation: number of experts vs performance
+
+### Scaling Tests
+- [ ] Start with 2 experts, scale to 8
+- [ ] Test different k values (1, 2, 4)
+- [ ] Compare dense vs MoE at same active parameters
+- [ ] Test on different sequence lengths
 
 # nanoGPT
 
