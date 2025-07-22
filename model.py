@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from einops import rearrange
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -91,6 +93,51 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+#based right on https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L567
+#however we've removed the for loop.
+class MoeMLP(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok #top k
+        self.norm_topk_prob = config.norm_topk_prob #bool, normalize the topk probabilities, or not?
+
+        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+
+        self.experts = nn.ModuleList([
+            MLP(config) for _ in range(self.num_experts)            
+        ])
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+
+        router_logits = self.router(x_flat)
+        router_weights = F.softmax(router_logits, dim=1, dtype=torch.float) #float32 here for stability
+        router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
+
+        if self.norm_topk_prob:
+            router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1 if we have normalization on
+        router_weights.to(x.dtype)
+
+        output = torch.zeros_like(x_flat)
+
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts) #keep track which experts are active
+        
+        # n = batch * seq_len (number of tokens), k = num_experts_per_tok/ e = num_experts
+        expert_mask = rearrange(expert_mask, 'n k e -> e k n')
+
+        for expert_idx in range(self.num_experts):
+            idx, top_x = torch.where(expert_mask[expert_idx])
+
+            if len(top_x) > 0:
+                current_state = x_flat[top_x]
+                current_output = self.experts[expert_idx](current_state) * router_weights[top_x, idx, None]
+                output.index_add_(0, top_x, current_output.to(x.dtype))
+        
+        return output.view(batch_size, seq_len, hidden_dim), router_logits
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -105,6 +152,19 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class MoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.moe_mlp = MoeMLP(config)  # Replace mlp with moe_mlp
+        
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.moe_mlp(self.ln_2(x))
+        return x
+    
 @dataclass
 class GPTConfig:
     block_size: int = 1024
