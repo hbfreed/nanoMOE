@@ -16,7 +16,7 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
 ## Architecture Decisions
 
 ### Routing Strategy
-- **Router Type**: Top-k routing (k=2 following OLMoE)
+- **Router Type**: Top-k routing 
 - **Router Architecture**: Single linear layer per MoE block
 - **Normalization**: Layer norm before router (following OLMoE's approach)
 - **Auxiliary losses**: 
@@ -24,9 +24,10 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
   - Router z-loss for stability (coefficient ~0.001)
 
 ### Expert Configuration
+We'll do some ablations at the small scale to see what works well. 
 - **Expert granularity**: Replace FFN layers with MoE blocks
-- **Expert capacity**: 8 experts per layer (OLMoE uses 64, but for nano we can start smaller)
-- **Active experts**: Top-2 routing
+- **Expert capacity**: Starting with 8 experts per layer, OLMoE uses 64.
+- **Active experts**: OLMoE uses 8, maybe start with 2?
 - **Expert architecture**: Standard FFN (up projection → activation → down projection)
 
 ### Efficient Batching Strategy
