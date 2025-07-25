@@ -8,7 +8,6 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
     - [ ] Val loss < 1.467 for ~10M active parameters
     - [ ] Val loss ~= 1.467 for <10M active parameters
 - [ ] Must not use [for loops over the experts](https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L598C1-L598C51)
-    - [ ] Vanilla PyTorch version
     - [ ] Triton kernel version
     - [ ] Megablocks version?
 - [ ] Train GPT-2 Size MoE on OWT/Fineweb (Stretch Goal if feeling frisky, probably would have to be ~125m *total*, would have to see how efficient we can really get to do ~125m active!)
@@ -65,6 +64,43 @@ We'll do some ablations at the small scale to see what works well.
 - [ ] Implement expert dropout
 - [ ] Add router temperature scaling
 - [ ] Implement different routing strategies (could compare top-k vs expert choice)
+
+### Triton Implementation
+    #### Core Data Structures
+    - [ ] **Define BCSR format storage** - You'll need arrays for block data, column indices, row indices, and row offsets to efficiently store your sparse matrices
+    - [ ] **Set up block size constants** - Start with 128×128 blocks as the research shows this is optimal for GPU utilization
+
+    #### Token Routing & Permutation
+    - [ ] **Implement token-to-expert sorting** - Sort tokens by their assigned experts so all tokens for expert 0 come first, then expert 1, etc.
+    - [ ] **Add padding logic** - Pad each expert's token group to the nearest block boundary (e.g., if expert has 150 tokens, pad to 256)
+    - [ ] **Create permutation tracking** - Keep track of original token positions so you can unpermute the outputs later
+
+    #### SDD Kernel (Sparse = Dense × Dense)
+    - [ ] **Set up the kernel signature** - This takes your permuted tokens and first layer expert weights as dense matrices
+    - [ ] **Implement block iteration** - Loop through each non-zero block in your sparse output based on the topology
+    - [ ] **Add the core matmul** - Use Triton's `tl.dot` for the actual block matrix multiplication, accumulating results
+
+    #### DSD Kernel (Dense = Sparse × Dense)  
+    - [ ] **Create 2D grid structure** - Unlike SDD, this needs a 2D grid to handle the dense output efficiently
+    - [ ] **Implement row-wise iteration** - For each output row, iterate through all sparse blocks in that row
+    - [ ] **Handle output accumulation** - Sum contributions from each sparse block to produce the final dense output
+
+    #### Dynamic Topology Creation
+    - [ ] **Count tokens per expert** - Use the routing assignments to determine how many blocks each expert needs
+    - [ ] **Build sparse indices** - Generate the row/column index arrays that define which blocks are non-zero
+    - [ ] **Handle variable sizes** - Ensure your topology can adapt to different expert loads dynamically
+
+    #### Integration Points
+    - [ ] **Replace your loop-based implementation** - Swap out the for-loop over experts with calls to your SDD/DSD kernels
+    - [ ] **Add autotuning configs** - Set up Triton autotuning with different block sizes and stage counts
+    - [ ] **Implement fallback handling** - Have a plan for edge cases like empty experts or very small batch sizes
+
+    #### Testing & Validation
+    - [ ] **Unit test each kernel** - Verify SDD and DSD produce correct results compared to naive implementation
+    - [ ] **Profile memory usage** - Ensure you're actually saving memory compared to dense computation
+    - [ ] **Benchmark throughput** - Measure FLOPS and compare to your baseline implementation
+
+    Start with the SDD kernel since it's conceptually simpler (you control where outputs go), then tackle DSD once you're comfortable with the block-sparse concepts.
 
 ### Optimization
 - [ ] Profile memory usage vs dense model

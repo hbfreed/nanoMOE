@@ -14,9 +14,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
 from einops import rearrange
 
+from moe import sdd_kernel
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -94,8 +94,8 @@ class MLP(nn.Module):
         return x
 
 #based right on https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L567
-#however we've removed the for loop.
-class MoeMLP(nn.Module):
+#This loops over experts. obviously we don't want that long-term, so we are writing the triton kernel.
+class MoeMLPForLoop(nn.Module):
     
     def __init__(self, config):
         super().__init__()
@@ -137,6 +137,58 @@ class MoeMLP(nn.Module):
                 output.index_add_(0, top_x, current_output.to(x.dtype))
         
         return output.view(batch_size, seq_len, hidden_dim), router_logits
+
+class MoeMLP(nn.Module):
+    def __init__(self, config):
+        '''We should probably make the hidden size smaller so we don't have a bunch of gigantic experts?'''
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok # top k
+        self.norm_topk_prob = config.norm_topk_prob # bool
+
+        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+
+        self.w1 = nn.Parameter(torch.randn(config.n_embd, self.num_experts*4*config.n_embd)) # one big weight matrix with *all* the experts
+        self.w2 = nn.Parameter(torch.randn(self.num_experts*4*config.n_embd, config.n_embd))
+
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
+        assert x_flat.data_ptr() == x.data_ptr()  # sanity check that we're just doing a view
+
+        router_logits = self.router(x_flat)
+        router_weights = F.softmax(router_logits, dim=1, dtype=torch.float) #float32 here for stability
+        router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
+
+        if self.norm_topk_prob:
+            router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1 if we have normalization on
+        router_weights.to(x.dtype)
+
+        num_tokens = batch_size * seq_len
+        tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.long ,device=x.device)
+        block_sparse = torch.zeros(num_tokens, 4*n_embd*self.num_experts)
+
+        ...
+        #shape the x tensor correctly...
+        ...
+        sdd_kernel(
+            x_ptr=, # permuted tokens, dense [num_tokens, hidden_size]
+            w1_ptr=self.w1, # weight matrix, dense [hidden_size, ffn_hidden * num_experts]
+            output_ptr=block_sparse, # output matrix, sparse! [num_tokens, ffn_hidden * num_experts]
+            row_indices_ptr=, # which row block each active block is in
+            col_indices_ptr=, # which col block (expert) each active block is in
+            M=num_tokens,
+            N=n_embd*self.num_experts_per_tok, # ffn_hidden * num_experts
+            K=4*n_embd, # hidden_size
+            stride_xm=, stride_xk=,
+            stride_wk=, stride_wn=,
+            stride_om=, stride_on=,
+            BLOCK_M: tl.constexpr=128, # 128 (from paper, probably autotune this?)
+            BLOCK_N: tl.constexpr=128, # 128 (from paper, probably autotune this too?)
+            BLOCK_K: tl.constexpr=, # for inner loop tiling, autotune this
+):
+
+
 
 class Block(nn.Module):
 
