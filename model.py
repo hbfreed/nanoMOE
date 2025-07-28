@@ -161,7 +161,7 @@ class MoeMLP(nn.Module):
         router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
 
         if self.norm_topk_prob:
-            router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1 if we have normalization on
+            router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1
         router_weights.to(x.dtype)
 
         num_tokens = batch_size * seq_len
