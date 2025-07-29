@@ -139,21 +139,37 @@ class MoeMLPForLoop(nn.Module):
         return output.view(batch_size, seq_len, hidden_dim), router_logits
 
 class MoeMLP(nn.Module):
-    def __init__(self, config):
-        '''We should probably make the hidden size smaller so we don't have a bunch of gigantic experts?'''
+    def __init__(self, config,
+                 BLOCK_M: int = 128,
+                 BLOCK_N: int = 128,
+                 BLOCK_K: int = 32):
         super().__init__()
         self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok # top k
-        self.norm_topk_prob = config.norm_topk_prob # bool
+        self.num_experts_per_tok = config.num_experts_per_tok  # "k"
+        self.norm_topk_prob = config.norm_topk_prob
+        self.n_embd = config.n_embd
 
-        self.router = nn.Linear(config.n_embd, self.num_experts, bias=False)
+        d_ffn = (4 * self.n_embd) // self.num_experts_per_tok
+        self.d_ffn = ((d_ffn + BLOCK_N - 1) // BLOCK_N) * BLOCK_N  # round up for kernel friendliness
 
-        self.w1 = nn.Parameter(torch.randn(config.n_embd, self.num_experts*4*config.n_embd)) # one big weight matrix with *all* the experts
-        self.w2 = nn.Parameter(torch.randn(self.num_experts*4*config.n_embd, config.n_embd))
+        # Router
+        self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
+
+        # Expert matrices packed together
+        self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
+        self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
+        nn.init.xavier_uniform_(self.w1)
+        nn.init.xavier_uniform_(self.w2)
+
+        self.BLOCK_M = BLOCK_M
+        self.BLOCK_N = BLOCK_N
+        self.BLOCK_K = BLOCK_K
 
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
-        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
+        num_tokens = batch_size * seq_len
+
+        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden') #flatten to just tokens by hidden size
         assert x_flat.data_ptr() == x.data_ptr()  # sanity check that we're just doing a view
 
         router_logits = self.router(x_flat)
@@ -162,33 +178,49 @@ class MoeMLP(nn.Module):
 
         if self.norm_topk_prob:
             router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1
-        router_weights.to(x.dtype)
+        router_weights = router_weights.to(x.dtype)
+        selected_experts = selected_experts.to(torch.int32)
 
-        num_tokens = batch_size * seq_len
-        tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.long ,device=x.device)
-        block_sparse = torch.zeros(num_tokens, 4*n_embd*self.num_experts)
+        x_rep = x_flat.repeat_interleave(self.num_experts_per_tok, dim=0) #make k token copies to map to the experts
+        selected_experts_rep = selected_experts.reshape(-1)
+        router_weights_rep = router_weights.reshape(-1, 1)
 
-        ...
-        #shape the x tensor correctly...
-        ...
+        perm = torch.argsort(selected_experts_rep, stable=True)
+        x_grouped = x_rep[perm]
+        selected_experts_sorted = selected_experts_rep[perm]
+        router_weights_sorted = router_weights_rep[perm]
+
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.numel(), device=x.device)
+
+        row_indices_ptr = torch.div(
+            torch.arange(x_grouped.size(0), device=x.device, dtype=torch.int32),
+            self.BLOCK_M, rounding_mode='floor'
+        )
+        block_mask = ((torch.arange(x_grouped.size(0), device=x.device) % self.BLOCK_M) == 0)
+        row_indices_ptr = row_indices_ptr[block_mask].contiguous()
+        col_indices_ptr = selected_experts_sorted[block_mask].contiguous()
+
+        block_sparse = torch.empty(x_grouped.size(0), self.d_ffn, dtype=x.dtype, device=x.device)
+
+        stride_xm, stride_xk = x_grouped.stride()
+        stride_om, stride_on = block_sparse.stride()
+        stride_wk, stride_wn = self.w1.stride()
+
         sdd_kernel(
-            x_ptr=, # permuted tokens, dense [num_tokens, hidden_size]
-            w1_ptr=self.w1, # weight matrix, dense [hidden_size, ffn_hidden * num_experts]
-            output_ptr=block_sparse, # output matrix, sparse! [num_tokens, ffn_hidden * num_experts]
-            row_indices_ptr=, # which row block each active block is in
-            col_indices_ptr=, # which col block (expert) each active block is in
-            M=num_tokens,
-            N=n_embd*self.num_experts_per_tok, # ffn_hidden * num_experts
-            K=4*n_embd, # hidden_size
-            stride_xm=, stride_xk=,
-            stride_wk=, stride_wn=,
-            stride_om=, stride_on=,
-            BLOCK_M: tl.constexpr=128, # 128 (from paper, probably autotune this?)
-            BLOCK_N: tl.constexpr=128, # 128 (from paper, probably autotune this too?)
-            BLOCK_K: tl.constexpr=, # for inner loop tiling, autotune this
-):
-
-
+            x_ptr=x_grouped,
+            w1_ptr=self.w1,
+            output_ptr=block_sparse,
+            row_indices_ptr=row_indices_ptr,
+            col_indices_ptr=col_indices_ptr,
+            M=x_grouped.size(0),
+            N=self.d_ffn,
+            K=self.n_embd,
+            stride_xm=stride_xm, stride_xk=stride_xk,
+            stride_wk=stride_wk, stride_wn=stride_wn,
+            stride_om=stride_om, stride_on=stride_on,
+            BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K
+        )
 
 class Block(nn.Module):
 
