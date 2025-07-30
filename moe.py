@@ -11,7 +11,7 @@ def sdd_kernel(
     row_indices_ptr, # which row block each active block is in
     col_indices_ptr, # which col block (expert) each active block is in
     M, # num_tokens (padded to multiple of BLOCK_M)
-    N, # ffn_hidden * num_experts
+    N, # ffn_hidden per expert (d_ffn)
     K, # hidden_size
     stride_xm, stride_xk,
     stride_wk, stride_wn,
