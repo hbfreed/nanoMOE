@@ -20,10 +20,10 @@ def sdd_kernel(
     BLOCK_N: tl.constexpr, # 128 (from paper, probably autotune this too?)
     BLOCK_K: tl.constexpr, # for inner loop tiling
 ):
-    block_id = tl.program_id(0)
+    pid = tl.program_id(0)
     
-    row_idx = tl.load(row_indices_ptr + block_id)
-    col_idx = tl.load(col_indices_ptr + block_id)
+    row_idx = tl.load(row_indices_ptr + pid)
+    col_idx = tl.load(col_indices_ptr + pid)
     
     row_start = row_idx * BLOCK_M  # token offset
     col_start = col_idx * BLOCK_N  # expert offset
@@ -48,7 +48,11 @@ def sdd_kernel(
 
 
 @triton.jit
-def dsd():
+def dsd(
+    block_sparse_ptr,
+    w2_ptr,
+    output_ptr,
+):
     pass
 
 @triton.jit

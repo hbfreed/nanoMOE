@@ -169,68 +169,57 @@ class MoeMLP(nn.Module):
         batch_size, seq_len, n_embd = x.shape
         num_tokens = batch_size * seq_len
 
-        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden') #flatten to just tokens by hidden size
-        # print("x_flat", x_flat.shape)
-        assert x_flat.data_ptr() == x.data_ptr()  # sanity check that we're just doing a view
+        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
+        assert x_flat.data_ptr() == x.data_ptr()
 
         router_logits = self.router(x_flat)
-        router_weights = F.softmax(router_logits, dim=1, dtype=torch.float) #float32 here for stability
-        # print('router weights',router_weights.shape)
+        router_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
-        # print('router weights topk',router_weights.shape)
-        # print('router experts',selected_experts.shape)
-
 
         if self.norm_topk_prob:
-            router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1
+            router_weights /= router_weights.sum(dim=-1, keepdim=True)
         router_weights = router_weights.to(x.dtype)
         selected_experts = selected_experts.to(torch.int16)
-        # print("selected_experts", selected_experts.shape)
 
-        x_rep = x_flat.repeat_interleave(self.num_experts_per_tok, dim=0) #make k token copies to map to the experts
-        # print("x_rep", x_rep.shape)
+        x_rep = x_flat.repeat_interleave(self.num_experts_per_tok, dim=0)
         selected_experts_rep = selected_experts.reshape(-1)
-        # print("selected_experts_rep", selected_experts_rep)
         router_weights_rep = router_weights.reshape(-1, 1)
-        # print("router_weights_rep", router_weights_rep.shape)
 
-        expert_sort_indices = torch.argsort(selected_experts_rep, stable=True) #sort tokens by expert assignment
-        print("expert_sort_indices", expert_sort_indices.shape)
+        expert_sort_indices = torch.argsort(selected_experts_rep, stable=True)
         x_grouped = x_rep[expert_sort_indices]
-        print("x_grouped", x_grouped.shape)
-        print("x_rep", x_rep.shape)
         selected_experts_sorted = selected_experts_rep[expert_sort_indices]
-        print("selected_experts_sorted", selected_experts_sorted.shape)
-        print("selected_experts_rep", selected_experts_rep.shape)
         router_weights_sorted = router_weights_rep[expert_sort_indices]
-        print("router_weights_sorted", router_weights_sorted.shape)
 
         inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
         inv_expert_sort_indices[expert_sort_indices] = torch.arange(expert_sort_indices.numel(), device=x.device)
-        print("inv_expert_sort_indices", inv_expert_sort_indices.shape)
 
         row_indices_ptr = torch.div(
             torch.arange(x_grouped.size(0), device=x.device, dtype=torch.int32),
             self.BLOCK_M, rounding_mode='floor'
         )
-        print("row_indices_ptr (before mask)", row_indices_ptr.shape)
         block_mask = ((torch.arange(x_grouped.size(0), device=x.device) % self.BLOCK_M) == 0)
         row_indices_ptr = row_indices_ptr[block_mask].contiguous()
-        print("row_indices_ptr (after mask)", row_indices_ptr.shape)
-        col_indices_ptr = selected_experts_sorted[block_mask].contiguous()
-        print("col_indices_ptr", col_indices_ptr.shape)
 
-        block_sparse = torch.empty(x_grouped.size(0), self.d_ffn, dtype=x.dtype, device=x.device) #num_tokens*k, d_ffn
-        print("block_sparse", block_sparse.shape)
+        row_block_to_expert = selected_experts_sorted[block_mask]
+        
+        blocks_per_expert = (self.d_ffn + self.BLOCK_N - 1) // self.BLOCK_N  # ceiling division
+        
+        block_offsets = torch.arange(0, self.d_ffn, self.BLOCK_N, device=x.device)  # [0, 128, 256, 384]
+        row_indices_ptr = row_indices_ptr.repeat_interleave(blocks_per_expert)
+        
+        block_indices_within_expert = torch.arange(blocks_per_expert, device=x.device)
+        col_indices_ptr = (row_block_to_expert[:, None] * blocks_per_expert + block_indices_within_expert[None, :]).flatten()
+        col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
+        col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
+
+        block_sparse = torch.empty(x_grouped.size(0), self.num_experts * self.d_ffn, dtype=x.dtype, device=x.device)
 
         stride_xm, stride_xk = x_grouped.stride()
-        print("stride_xm", stride_xm, "stride_xk", stride_xk)
         stride_om, stride_on = block_sparse.stride()
-        print("stride_om", stride_om, "stride_on", stride_on)
         stride_wk, stride_wn = self.w1.stride()
-        print("stride_wk", stride_wk, "stride_wn", stride_wn)
 
-        sdd_kernel[(len(row_indices_ptr),)](
+        num_blocks = len(col_indices_ptr)
+        sdd_kernel[(num_blocks,)](
             x_ptr=x_grouped,
             w1_ptr=self.w1,
             output_ptr=block_sparse,
@@ -248,30 +237,17 @@ class MoeMLP(nn.Module):
         # Apply GELU activation
         block_sparse = F.gelu(block_sparse)
         
-        # Apply router weights (element-wise multiplication)
-        block_sparse = block_sparse * router_weights_sorted
-        
-        # TODO: Apply second matmul (w2) - DSD kernel needed
-        # For now, we'll return the intermediate result for debugging
-        # block_sparse = dsd_kernel(block_sparse, self.w2, ...)
-        
-        # TODO: Restore original token order using inv_expert_sort_indices
-        # output_unsorted = block_sparse[inv_expert_sort_indices]
-        
-        # TODO: Reshape back to [batch_size, seq_len, n_embd]
-        # output = output_unsorted.view(batch_size, seq_len, self.n_embd)
-        
-        # For debugging, return intermediate result and debug info
-        return block_sparse, router_logits, {
+        debug_info = {
             'col_indices_ptr': col_indices_ptr,
             'row_indices_ptr': row_indices_ptr,
             'selected_experts': selected_experts,
             'selected_experts_sorted': selected_experts_sorted,
-            'expert_sort_indices': expert_sort_indices,
+            'x_grouped': x_grouped,
+            'router_weights_sorted': router_weights_sorted,
             'inv_expert_sort_indices': inv_expert_sort_indices,
-            'router_weights_sorted': router_weights_sorted
         }
 
+        return block_sparse, router_logits, debug_info
 class Block(nn.Module):
 
     def __init__(self, config):
