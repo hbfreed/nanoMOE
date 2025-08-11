@@ -212,7 +212,7 @@ class MoeMLP(nn.Module):
         col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
         col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
 
-        block_sparse = torch.empty(x_grouped.size(0), self.num_experts * self.d_ffn, dtype=x.dtype, device=x.device)
+        block_sparse = torch.empty(x_grouped.size(0), self.num_experts * self.d_ffn, dtype=x.dtype, device=x.device) #the WHOLE sparse matrix
 
         stride_xm, stride_xk = x_grouped.stride()
         stride_om, stride_on = block_sparse.stride()
