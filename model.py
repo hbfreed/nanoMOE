@@ -139,114 +139,174 @@ class MoeMLPForLoop(nn.Module):
         return output.view(batch_size, seq_len, hidden_dim), router_logits
 
 class MoeMLP(nn.Module):
-    def __init__(self, config,
-                 BLOCK_M: int = 128,
-                 BLOCK_N: int = 128,
-                 BLOCK_K: int = 32):
+    def __init__(self, 
+                 num_experts: int = 8,
+                 num_experts_per_tok: int = 2,
+                 n_embd: int = 32,
+                 norm_topk_prob: bool = True,
+                 block_size: int = 64,
+                 block_k: int = 64):
         super().__init__()
-        self.num_experts = config.num_experts
-        self.num_experts_per_tok = config.num_experts_per_tok  # "k"
-        self.norm_topk_prob = config.norm_topk_prob
-        self.n_embd = config.n_embd
-
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.norm_topk_prob = norm_topk_prob
+        self.n_embd = n_embd
+        
+        # Round up FFN size to be block-friendly
         d_ffn = (4 * self.n_embd) // self.num_experts_per_tok
-        self.d_ffn = ((d_ffn + BLOCK_N - 1) // BLOCK_N) * BLOCK_N  # round up for kernel friendliness
-
-        self.BLOCK_M = BLOCK_M
-        self.BLOCK_N = BLOCK_N
-        self.BLOCK_K = BLOCK_K
-
-        # Router
+        self.d_ffn = ((d_ffn + block_size - 1) // block_size) * block_size
+        
+        self.block_size = block_size
+        self.block_k = block_k
+        
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
-
-        # Expert matrices packed together
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
         self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
-        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06) # olmoe initialization ¯\_(ツ)_/¯ 
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06) #olmoe init
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
-
-    def forward(self, x):
-        batch_size, seq_len, n_embd = x.shape
-        num_tokens = batch_size * seq_len
-
-        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
-        assert x_flat.data_ptr() == x.data_ptr()
-
+    
+    def _route_tokens(self, x_flat):
+        """Route tokens to experts and compute weights."""
         router_logits = self.router(x_flat)
         router_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
-
+        
         if self.norm_topk_prob:
             router_weights /= router_weights.sum(dim=-1, keepdim=True)
-        router_weights = router_weights.to(x.dtype)
-        selected_experts = selected_experts.to(torch.int16)
-
+        
+        router_weights = router_weights.to(x_flat.dtype)
+        return router_weights, selected_experts
+    
+    def _sort_by_expert(self, x_flat, router_weights, selected_experts):
+        """Replicate tokens for each expert and sort by expert assignment."""
         x_rep = x_flat.repeat_interleave(self.num_experts_per_tok, dim=0)
         selected_experts_rep = selected_experts.reshape(-1)
         router_weights_rep = router_weights.reshape(-1, 1)
-
+        
         expert_sort_indices = torch.argsort(selected_experts_rep, stable=True)
-        x_grouped = x_rep[expert_sort_indices]
+        x_sorted = x_rep[expert_sort_indices]
         selected_experts_sorted = selected_experts_rep[expert_sort_indices]
         router_weights_sorted = router_weights_rep[expert_sort_indices]
-
+        
         inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
-        inv_expert_sort_indices[expert_sort_indices] = torch.arange(expert_sort_indices.numel(), device=x.device)
-
-        row_indices_ptr = torch.div(
-            torch.arange(x_grouped.size(0), device=x.device, dtype=torch.int32),
-            self.BLOCK_M, rounding_mode='floor'
+        inv_expert_sort_indices[expert_sort_indices] = torch.arange(
+            expert_sort_indices.numel(), device=x_flat.device
         )
-        block_mask = ((torch.arange(x_grouped.size(0), device=x.device) % self.BLOCK_M) == 0)
-        row_indices_ptr = row_indices_ptr[block_mask].contiguous()
-
-        row_block_to_expert = selected_experts_sorted[block_mask]
         
-        blocks_per_expert = (self.d_ffn + self.BLOCK_N - 1) // self.BLOCK_N  # ceiling division
+        return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
+    
+    def _pad_to_blocks(self, x_sorted, router_weights_sorted, selected_experts_sorted):
+        """Pad each expert's tokens to multiples of block_size."""
+        tokens_per_expert = torch.bincount(
+            selected_experts_sorted, 
+            minlength=self.num_experts
+        )
         
-        block_offsets = torch.arange(0, self.d_ffn, self.BLOCK_N, device=x.device)  # [0, 128, 256, 384]
-        row_indices_ptr = row_indices_ptr.repeat_interleave(blocks_per_expert)
+        tokens_per_expert_padded = ((tokens_per_expert + self.block_size - 1) // self.block_size) * self.block_size
         
-        block_indices_within_expert = torch.arange(blocks_per_expert, device=x.device)
-        col_indices_ptr = (row_block_to_expert[:, None] * blocks_per_expert + block_indices_within_expert[None, :]).flatten()
-        col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
-
-        block_sparse = torch.empty(x_grouped.size(0), self.num_experts * self.d_ffn, dtype=x.dtype, device=x.device) #the WHOLE sparse matrix
-
-        stride_xm, stride_xk = x_grouped.stride()
+        cumsum_original = F.pad(tokens_per_expert.cumsum(0), (1, 0))
+        cumsum_padded = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))
+        total_padded_tokens = cumsum_padded[-1].item()
+        x_padded = torch.zeros(
+            (total_padded_tokens, self.n_embd), 
+            dtype=x_sorted.dtype, 
+            device=x_sorted.device
+        )
+        router_weights_padded = torch.zeros(
+            (total_padded_tokens, 1), 
+            dtype=router_weights_sorted.dtype, 
+            device=router_weights_sorted.device
+        )
+        
+        for exp_id in range(self.num_experts):
+            n_tokens = tokens_per_expert[exp_id].item()
+            if n_tokens > 0:
+                src_start = cumsum_original[exp_id].item()
+                src_end = cumsum_original[exp_id + 1].item()
+                
+                dst_start = cumsum_padded[exp_id].item()
+                dst_end = dst_start + n_tokens
+                
+                x_padded[dst_start:dst_end] = x_sorted[src_start:src_end]
+                router_weights_padded[dst_start:dst_end] = router_weights_sorted[src_start:src_end]
+        
+        return x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded
+    
+    def _create_sparse_indices(self, tokens_per_expert_padded):
+        """Create row and column indices for sparse blocks (vectorized!)."""
+        device = tokens_per_expert_padded.device
+        
+        num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
+        num_ffn_blocks = (self.d_ffn + self.block_size - 1) // self.block_size
+        
+        blocks_per_expert = num_token_blocks_per_expert * num_ffn_blocks
+        total_blocks = blocks_per_expert.sum().item()
+        
+        if total_blocks == 0:
+            return torch.tensor([], dtype=torch.int32, device=device), \
+                   torch.tensor([], dtype=torch.int32, device=device)
+        
+        expert_ids = torch.repeat_interleave(
+            torch.arange(self.num_experts, device=device),
+            blocks_per_expert
+        )
+        
+        within_expert_block_idx = torch.cat([
+            torch.arange(n.item(), device=device) 
+            for n in blocks_per_expert if n > 0
+        ])
+        
+        token_block_offset = F.pad(num_token_blocks_per_expert.cumsum(0)[:-1], (1, 0))
+        row_indices = token_block_offset[expert_ids] + (within_expert_block_idx // num_ffn_blocks)
+        col_indices = expert_ids * num_ffn_blocks + (within_expert_block_idx % num_ffn_blocks)
+        
+        return row_indices.int(), col_indices.int()
+    
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
+        
+        router_weights, selected_experts = self._route_tokens(x_flat)
+        
+        x_sorted, selected_experts_sorted, router_weights_sorted, inv_indices = self._sort_by_expert(
+            x_flat, router_weights, selected_experts
+        )
+        
+        x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded = self._pad_to_blocks(
+            x_sorted, router_weights_sorted, selected_experts_sorted
+        )
+        
+        row_indices, col_indices = self._create_sparse_indices(tokens_per_expert_padded)
+        
+        total_padded_tokens = cumsum_padded[-1].item()
+        block_sparse = torch.zeros(
+            (total_padded_tokens, self.d_ffn * self.num_experts),
+            dtype=x.dtype, 
+            device=x.device
+        )
+        
+        stride_xm, stride_xk = x_padded.stride()
         stride_om, stride_on = block_sparse.stride()
         stride_wk, stride_wn = self.w1.stride()
-
-        num_blocks = len(col_indices_ptr)
-        sdd_kernel[(num_blocks,)](
-            x_ptr=x_grouped,
-            w1_ptr=self.w1,
-            output_ptr=block_sparse,
-            row_indices_ptr=row_indices_ptr,
-            col_indices_ptr=col_indices_ptr,
-            M=x_grouped.size(0),
-            N=self.d_ffn,
-            K=self.n_embd,
-            stride_xm=stride_xm, stride_xk=stride_xk,
-            stride_wk=stride_wk, stride_wn=stride_wn,
-            stride_om=stride_om, stride_on=stride_on,
-            BLOCK_M=self.BLOCK_M, BLOCK_N=self.BLOCK_N, BLOCK_K=self.BLOCK_K
-        )
+        num_blocks = len(row_indices)
+        if num_blocks > 0:
+            sdd_kernel[num_blocks,](
+                x_padded, self.w1, block_sparse,
+                row_indices, col_indices,
+                stride_xm, stride_xk,
+                stride_wk, stride_wn, 
+                stride_om, stride_on,
+                self.n_embd,
+                BLOCK_SIZE=self.block_size,
+                BLOCK_K=self.block_k
+            )
         
-        # Apply GELU activation
-        block_sparse = F.gelu(block_sparse)
+        # TODO: Apply activation (GELU here)
+        # TODO: DSD kernel
+        # TODO: Scale by router weights
+        # TODO: Unpermute back to original token order
         
-        debug_info = {
-            'col_indices_ptr': col_indices_ptr,
-            'row_indices_ptr': row_indices_ptr,
-            'selected_experts': selected_experts,
-            'selected_experts_sorted': selected_experts_sorted,
-            'x_grouped': x_grouped,
-            'router_weights_sorted': router_weights_sorted,
-            'inv_expert_sort_indices': inv_expert_sort_indices,
-        }
-
-        return block_sparse, router_logits, debug_info
+        return x_padded
 class Block(nn.Module):
 
     def __init__(self, config):
