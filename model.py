@@ -162,7 +162,7 @@ class MoeMLP(nn.Module):
         # Expert matrices packed together
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
         self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
-        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06) # how they initialized in olmoe ¯\_(ツ)_/¯ 
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06) # olmoe initialization ¯\_(ツ)_/¯ 
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
     def forward(self, x):
@@ -209,7 +209,6 @@ class MoeMLP(nn.Module):
         
         block_indices_within_expert = torch.arange(blocks_per_expert, device=x.device)
         col_indices_ptr = (row_block_to_expert[:, None] * blocks_per_expert + block_indices_within_expert[None, :]).flatten()
-        col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
         col_indices_ptr = col_indices_ptr.to(torch.int16).contiguous()
 
         block_sparse = torch.empty(x_grouped.size(0), self.num_experts * self.d_ffn, dtype=x.dtype, device=x.device) #the WHOLE sparse matrix

@@ -31,9 +31,9 @@ def reconstruct_from_blocks(output, num_row_blocks, num_col_blocks, block_size=6
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 32}, num_warps=2, num_stages=3),
-        triton.Config({'BLOCK_SIZE': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE': 128}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE': 32}),
+        triton.Config({'BLOCK_SIZE': 64}),
+        triton.Config({'BLOCK_SIZE': 128}),
     ],
     key=['hidden_size'],
 )
@@ -41,39 +41,40 @@ def reconstruct_from_blocks(output, num_row_blocks, num_col_blocks, block_size=6
 def sdd_kernel(
     x_ptr, w1_ptr, output_ptr,
     row_indices_ptr, col_indices_ptr,
-    stride_x_row, stride_w1_row, stride_output_row,
+    stride_x_row, stride_w1_row, stride_output_row, stride_output_col,
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
 ):
     """lots of comments because i'm still learning triton!"""
     pid = tl.program_id(0)
     
-    row_idx = tl.load(row_indices_ptr + pid) # figure out where in 
+    row_idx = tl.load(row_indices_ptr + pid) # figure out which row/col we want to operate on: each pid gets it's own block
     col_idx = tl.load(col_indices_ptr + pid)
     
-    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32) # initialize the *one block* we're computing per program
     
-    for k in range(0, hidden_size, BLOCK_SIZE):
-        x_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
-        x_col_offsets = k + tl.arange(0, BLOCK_SIZE)[None, :]
-        x_ptrs = x_ptr + x_row_offsets * stride_x_row + x_col_offsets
+    # one output block of block_size x block_size will take multiple block_size x block_size tiles to compute, so loop
+    for k in range(0, hidden_size, BLOCK_SIZE): # loop to hidden_size taking block size steps
+        x_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None] # add the beginning pointer we're working with to the arange of block sizes giving us a vector of the pointers we're operating on.
+        x_col_offsets = k + tl.arange(0, BLOCK_SIZE)[None, :] # add which column we're currently operating on to the arange of block sizes
+        x_ptrs = x_ptr + x_row_offsets * stride_x_row + x_col_offsets #(pointwise multiplication) using the numbers from above, pick out the pointers from x we'll use
         
-        x_mask = (x_col_offsets < hidden_size)
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        x_mask = (x_col_offsets < hidden_size) # if a column offset gets larger than the hidden size, we don't want to operate on it, so mask it.
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0) #load up the pointers we've decided on, mask it out if necessary.
         
-        w1_row_offsets = k + tl.arange(0, BLOCK_SIZE)[:, None]
-        w1_col_offsets = col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
-        w1_ptrs = w1_ptr + w1_row_offsets * stride_w1_row + w1_col_offsets
+        w1_row_offsets = k + tl.arange(0, BLOCK_SIZE)[:, None] # which column we're operating on, similar to x_col_offsets to pick up where we left off with last block
+        w1_col_offsets = col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :] # pick the correct columns, but crucially we're choosing which expert we're using!
+        w1_ptrs = w1_ptr + w1_row_offsets * stride_w1_row + w1_col_offsets #same as above's pointer choosing step, pick out w1's pointers.
         
-        w1_mask = (w1_row_offsets < hidden_size)
-        w1_tile = tl.load(w1_ptrs, mask=w1_mask, other=0.0)
+        w1_mask = (w1_row_offsets < hidden_size) #same masking
+        w1_tile = tl.load(w1_ptrs, mask=w1_mask, other=0.0) # same loading
         
-        acc += tl.dot(x_tile, w1_tile)
+        acc += tl.dot(x_tile, w1_tile) # do the matmul between the tiles we've selected
     
-    output_row_offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
-    output_col_offsets = tl.arange(0, BLOCK_SIZE)[None, :]
-    output_ptrs = output_ptr + output_row_offsets * stride_output_row + output_col_offsets
-    tl.store(output_ptrs, acc)
+    output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None] #where in the output matrix we'll go
+    output_col_offsets = col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :] #just need the block size for column since we only compute block size blocks
+    output_ptrs = output_ptr + output_row_offsets * stride_output_row + output_col_offsets * stride_output_col
+    tl.store(output_ptrs, acc) #store to the output matrix
 
 
 @triton.jit
