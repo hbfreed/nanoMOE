@@ -306,7 +306,7 @@ class MoeMLP(nn.Module):
         # TODO: Scale by router weights
         # TODO: Unpermute back to original token order
         
-        return x_padded
+        return block_sparse
 class Block(nn.Module):
 
     def __init__(self, config):
