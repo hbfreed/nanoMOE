@@ -258,9 +258,10 @@ class MoeMLP(nn.Module):
         
         token_block_offset = F.pad(num_token_blocks_per_expert.cumsum(0)[:-1], (1, 0))
         row_indices = token_block_offset[expert_ids] + (within_expert_block_idx // num_ffn_blocks)
-        col_indices = expert_ids * num_ffn_blocks + (within_expert_block_idx % num_ffn_blocks)
+        weight_col_indices = expert_ids * num_ffn_blocks + (within_expert_block_idx % num_ffn_blocks)
+        output_col_indices = within_expert_block_idx % num_ffn_blocks
         
-        return row_indices.int(), col_indices.int()
+        return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
     
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
@@ -276,11 +277,11 @@ class MoeMLP(nn.Module):
             x_sorted, router_weights_sorted, selected_experts_sorted
         )
         
-        row_indices, col_indices = self._create_sparse_indices(tokens_per_expert_padded)
+        row_indices, weight_col_indices, output_col_indices = self._create_sparse_indices(tokens_per_expert_padded)
         
         total_padded_tokens = cumsum_padded[-1].item()
         block_sparse = torch.zeros(
-            (total_padded_tokens, self.d_ffn * self.num_experts),
+            (total_padded_tokens, self.d_ffn),
             dtype=x.dtype, 
             device=x.device
         )
@@ -292,7 +293,7 @@ class MoeMLP(nn.Module):
         if num_blocks > 0:
             sdd_kernel[num_blocks,](
                 x_padded, self.w1, block_sparse,
-                row_indices, col_indices,
+                row_indices, weight_col_indices, output_col_indices,
                 stride_xm, stride_xk,
                 stride_wk, stride_wn, 
                 stride_om, stride_on,
