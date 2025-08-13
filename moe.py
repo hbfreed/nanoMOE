@@ -2,6 +2,11 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
+import os
+
+# Enable verbose Triton autotuning output unless explicitly disabled by the environment
+if os.environ.get("TRITON_PRINT_AUTOTUNING") is None:
+    os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 '''Note: Karpathy calls hidden_size the n_embd. ffn_hidden_size is 4*n_embd (or hidden size!)'''
 
 # @triton.autotune(
@@ -31,7 +36,7 @@ def sdd_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """SDD kernel for compact block-sparse matrix multiplication."""
+    """lots of comments because i'm sill learning triton!"""
     pid = tl.program_id(0)
     
     # Load indices for this block
@@ -78,12 +83,10 @@ def dsd(
     w2_ptr,
     output_ptr,
 ):
-    pass
+    pid = tl.program_id(0)
+
+
 
 @triton.jit
 def gelu():
-    pass
-
-@triton.jit
-def padded_scatter():
     pass

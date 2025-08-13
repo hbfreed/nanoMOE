@@ -301,12 +301,12 @@ class MoeMLP(nn.Module):
                 BLOCK_SIZE=self.block_size,
                 BLOCK_K=self.block_k
             )
-        
-        # TODO: Apply activation (GELU here)
+        print(block_sparse)        
+        block_sparse = F.gelu(block_sparse)
         # TODO: DSD kernel
+
         # TODO: Scale by router weights
         # TODO: Unpermute back to original token order
-        
         return block_sparse
 class Block(nn.Module):
 

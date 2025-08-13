@@ -64,7 +64,7 @@ def test_sdd_kernel_vs_naive():
     
     # Block-by-block verification
     max_diff = 0.0
-    for i, (row_idx, weight_col_idx, output_col_idx) in enumerate(zip(row_indices[:4], weight_col_indices[:4], output_col_indices[:4])):
+    for i, (row_idx, weight_col_idx, output_col_idx) in enumerate(zip(row_indices, weight_col_indices, output_col_indices)):
         # Extract the exact data the kernel should process
         start_row = row_idx * config.block_size
         end_row = start_row + config.block_size
