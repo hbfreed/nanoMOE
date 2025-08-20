@@ -11,14 +11,26 @@ if os.environ.get("TRITON_PRINT_AUTOTUNING") is None:
 
 # @triton.autotune(
 #     configs=[
+#         # Small blocks for small batch sizes or debugging
+#         triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 16}),
+#         triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 32}),
 #         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 16}),
 #         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 32}),
+#         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 64}),
+#         # Medium blocks
 #         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 16}),
 #         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 32}),
 #         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 64}),
+#         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 128}),
+#         # Large blocks for large batch/hidden sizes
 #         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 32}),
 #         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 64}),
 #         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 128}),
+#         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 256}),
+#         # Even larger for big models
+#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 64}),
+#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 128}),
+#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 256}),
 #     ],
 #     key=['hidden_size'],
 # )
@@ -78,15 +90,83 @@ def sdd_kernel(
     tl.store(output_ptrs, acc)
 
 @triton.jit
-def dsd(
-    block_sparse_ptr,
-    w2_ptr,
-    output_ptr,
+def dsd_kernel(
+    x_ptr, # the block sparse matrix, but compact: total_padded_tokens x d_ffn
+    w2_ptr, # the dense weights: d_ffn * num_experts x hidden_size
+    output_ptr, # the out matrix: total_padded_tokens x hidden_size
+    row_indices_ptr, 
+    weight_row_indices_ptr,
+    stride_xm, stride_xk, # strides for x
+    stride_wk, stride_wn, # strides for *w2*          
+    stride_om, stride_on, # strides for the output
+    d_ffn, hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr, # reduction dimension
+
 ):
     pid = tl.program_id(0)
 
+    # Load indices for the block
+    row_idx = tl.load(row_indices_ptr + pid) # pick the tokens we're working on
+    weight_row_idx = tl.load(weight_row_indices_ptr + pid) # since w2 is (d_ffn*n_exp,hidden size), pick out the right rows to operate with 
+
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32) # (block_size, block_k)@(block_k, block_size)
+    
+    for k in range(0, d_ffn, BLOCK_K):
+        # Load BLOCK_SIZE x BLOCK_K tile from input
+        x_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
+        x_col_offsets = k + tl.arange(0, BLOCK_K)[None, :]
+        x_ptrs = x_ptr + x_row_offsets * stride_xm + x_col_offsets * stride_xk
+        
+        x_mask = (x_col_offsets < d_ffn)
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+
+        w2_row_offsets = weight_row_idx * d_ffn + k + tl.arange(0, BLOCK_K)[:, None]
+        w2_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+        w2_ptrs = w2_ptr + w2_row_offsets * stride_wk + w2_col_offsets * stride_wn
+        
+        w2_mask = (w2_col_offsets < hidden_size)
+        w2_tile = tl.load(w2_ptrs, mask=w2_mask, other=0.0)
+
+        acc += tl.dot(x_tile, w2_tile)
+    
+    output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
+    output_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    output_ptrs = output_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
+
+    tl.store(output_ptrs, acc)
+
+@triton.jit
+def sdd_backward_act_kernel():
+    pass
+
+@triton.jit
+def sdd_backward_weight_kernel():
+    pass
+
+@triton.jit
+def dsd_backward_act_kernel():
+    """Computes: grad_sparse_act = grad_output @ weight_down.T
+       Pretty similar to the sdd calculation! We calculate ∂L/∂X = ∂L/∂Y @ W_2^T, and make sure each expert's tokens goes to the right place."""
 
 
 @triton.jit
-def gelu():
+def dsd_backward_weight_kernel():
+    """Computes: grad_weight_down = sparse_activations.T @ grad_output
+       We calculate ∂L/∂W = X^T @ ∂L/∂Y"""
+    # Each block handles an expert's weight gradient
+    # Needs to accumulate across all tokens for that expert
+    # Might need atomics if multiple blocks update same weight
+
+@triton.jit
+def gelu(x):
+    '''gelu based on https://arxiv.org/pdf/1606.08415#page=2'''
+    pass
+
+def approx_gelu(x):
+    '''approximated gelu based on https://arxiv.org/pdf/1606.08415#page=2'''
+    pass
+
+@triton.jit
+def tanh(x):
     pass

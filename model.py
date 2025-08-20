@@ -15,8 +15,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from einops import rearrange
+import triton
 
-from moe import sdd_kernel
+from moe import sdd_kernel, dsd_kernel
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -152,8 +153,8 @@ class MoeMLP(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.n_embd = n_embd
         
-        # Round up FFN size to be block-friendly
-        d_ffn = (4 * self.n_embd) // self.num_experts_per_tok
+        # Each expert should have the full FFN size (4 * n_embd)
+        d_ffn = 4 * self.n_embd  # <-- Remove the division!
         self.d_ffn = ((d_ffn + block_size - 1) // block_size) * block_size
         
         self.block_size = block_size
@@ -162,7 +163,8 @@ class MoeMLP(nn.Module):
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
         self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
-        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06) #olmoe init
+        
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
     
     def _route_tokens(self, x_flat):
@@ -287,8 +289,8 @@ class MoeMLP(nn.Module):
         )
         
         stride_xm, stride_xk = x_padded.stride()
-        stride_om, stride_on = block_sparse.stride()
         stride_wk, stride_wn = self.w1.stride()
+        stride_om, stride_on = block_sparse.stride()
         num_blocks = len(row_indices)
         if num_blocks > 0:
             sdd_kernel[num_blocks,](
@@ -301,13 +303,41 @@ class MoeMLP(nn.Module):
                 BLOCK_SIZE=self.block_size,
                 BLOCK_K=self.block_k
             )
-        print(block_sparse)        
+        
         block_sparse = F.gelu(block_sparse)
-        # TODO: DSD kernel
+        expert_output = torch.zeros(
+            (total_padded_tokens,self.n_embd),
+            dtype=x.dtype,
+            device=x.device
+        )
+        num_token_blocks = len(row_indices)
+        num_hidden_blocks = triton.cdiv(self.n_embd, self.block_size)
+        stride_xm, stride_xk = block_sparse.stride()
+        stride_wk, stride_wn = self.w2.stride()
+        stride_om, stride_on = expert_output.stride()
+        dsd_kernel[(num_token_blocks,num_hidden_blocks)](
+            block_sparse, self.w2, expert_output,
+            row_indices_ptr=row_indices,
+            weight_row_indices_ptr=weight_col_indices,
+            stride_xm=stride_xm, stride_xk=stride_xk,
+            stride_wk=stride_wk, stride_wn=stride_wn,
+            stride_om=stride_om, stride_on=stride_on,
+            d_ffn=self.d_ffn, hidden_size=self.n_embd,
+            BLOCK_SIZE=self.block_size,
+            BLOCK_K=self.block_k,             
+        )
+        print(f"padded shape: {expert_output.shape}")
+        print(f"padded output:\n{expert_output}")
+        #get rid of the zeroes!
+        mask = (expert_output != 0).any(dim=1)
+        expert_output = expert_output[mask]
+        print(f"unpadded shape: {expert_output.shape}")
+        print(f"unpadded output:\n{expert_output}")
+        # expert_output = expert_output * router_weights_sorted
 
         # TODO: Scale by router weights
         # TODO: Unpermute back to original token order
-        return block_sparse
+        return expert_output 
 class Block(nn.Module):
 
     def __init__(self, config):
