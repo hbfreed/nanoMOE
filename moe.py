@@ -108,7 +108,7 @@ def dsd_kernel(
 
     # Load indices for the block
     row_idx = tl.load(row_indices_ptr + pid) # pick the tokens we're working on
-    weight_row_idx = tl.load(weight_row_indices_ptr + pid) # since w2 is (d_ffn*n_exp,hidden size), pick out the right rows to operate with 
+    weight_row_idx = tl.load(weight_row_indices_ptr + pid) # since w2 is (d_ffn*num_experts, hidden_size), pick out the right rows to operate with 
 
     acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32) # (block_size, block_k)@(block_k, block_size)
     
@@ -145,10 +145,51 @@ def sdd_backward_weight_kernel():
     pass
 
 @triton.jit
-def dsd_backward_act_kernel():
-    """Computes: grad_sparse_act = grad_output @ weight_down.T
-       Pretty similar to the sdd calculation! We calculate ∂L/∂X = ∂L/∂Y @ W_2^T, and make sure each expert's tokens goes to the right place."""
+def dsd_backward_act_kernel(
+    grad_output_ptr, # ∂L/∂Y
+    w2_t_ptr, # w2 transposed
+    grad_act_ptr, # ∂L/∂X
+    row_indices_ptr,
+    weight_col_indices_ptr,
+    output_col_indices_ptr, 
+    stride_gm, stride_gk,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Computes grad_sparse_act = grad_output @ w2.T"""
+    pid = tl.program_id(0)
+    row_idx = tl.load(row_indices_ptr + pid)
+    weight_col_idx = tl.load(weight_col_indices_ptr + pid)
+    output_col_idx = tl.load(output_col_indices_ptr + pid)
 
+    acc = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+
+    for k in range(0, hidden_size, BLOCK_K):
+        # Load from grad_output
+        grad_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
+        grad_col_offsets = k + tl.arange(0, BLOCK_K)[None, :]
+        grad_ptrs = grad_output_ptr + grad_row_offsets * stride_gm + grad_col_offsets * stride_gk
+        grad_mask = (grad_col_offsets < hidden_size)
+        grad_tile = tl.load(grad_ptrs, mask=grad_mask, other=0.0)
+
+        # Load from w2.T
+        w2t_row_offsets = k + tl.arange(0, BLOCK_K)[:, None]
+        w2t_col_offsets = weight_col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+        w2t_ptrs = w2_t_ptr + w2t_row_offsets * stride_wk + w2t_col_offsets * stride_wn
+        w2t_mask = (w2t_row_offsets < hidden_size)  # Only mask the reduction dimension
+        w2t_tile = tl.load(w2t_ptrs, mask=w2t_mask, other=0.0)
+
+        # Accumulate
+        acc += tl.dot(grad_tile, w2t_tile)
+
+    # Store result
+    output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
+    output_col_offsets = output_col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    output_ptrs = grad_act_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
+    tl.store(output_ptrs, acc)
 
 @triton.jit
 def dsd_backward_weight_kernel():

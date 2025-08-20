@@ -318,7 +318,7 @@ class MoeMLP(nn.Module):
         dsd_kernel[(num_token_blocks,num_hidden_blocks)](
             block_sparse, self.w2, expert_output,
             row_indices_ptr=row_indices,
-            weight_row_indices_ptr=weight_col_indices,
+            weight_row_indices_ptr=weight_col_indices, #w2 is d_ffn*n_embd *rows* so we can reuse the indices
             stride_xm=stride_xm, stride_xk=stride_xk,
             stride_wk=stride_wk, stride_wn=stride_wn,
             stride_om=stride_om, stride_on=stride_on,
