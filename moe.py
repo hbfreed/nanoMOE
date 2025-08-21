@@ -194,7 +194,7 @@ def dsd_backward_act_kernel(
 @triton.jit
 def dsd_backward_weight_kernel():
     """Computes: grad_weight_down = sparse_activations.T @ grad_output
-       We calculate ∂L/∂W = X^T @ ∂L/∂Y"""
+       We compute ∂L/∂W = X^T @ ∂L/∂Y"""
     # Each block handles an expert's weight gradient
     # Needs to accumulate across all tokens for that expert
     # Might need atomics if multiple blocks update same weight
