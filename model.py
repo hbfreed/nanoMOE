@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from einops import rearrange
 import triton
 
-from moe import sdd_kernel, dsd_kernel
+from moe import SDD, DSD 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -177,7 +177,7 @@ class MoeMLP(nn.Module):
             router_weights /= router_weights.sum(dim=-1, keepdim=True)
         
         router_weights = router_weights.to(x_flat.dtype)
-        return router_weights, selected_experts
+        return router_weights, selected_experts, router_logits
     
     def _sort_by_expert(self, x_flat, router_weights, selected_experts):
         """Replicate tokens for each expert and sort by expert assignment."""
@@ -198,7 +198,7 @@ class MoeMLP(nn.Module):
         return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
     
     def _pad_to_blocks(self, x_sorted, router_weights_sorted, selected_experts_sorted):
-        """Pad each expert's tokens to multiples of block_size."""
+        """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
         tokens_per_expert = torch.bincount(
             selected_experts_sorted, 
             minlength=self.num_experts
@@ -220,6 +220,9 @@ class MoeMLP(nn.Module):
             device=router_weights_sorted.device
         )
         
+        # Build unpadding indices while we're padding
+        unpad_indices = []
+        
         for exp_id in range(self.num_experts):
             n_tokens = tokens_per_expert[exp_id].item()
             if n_tokens > 0:
@@ -231,8 +234,13 @@ class MoeMLP(nn.Module):
                 
                 x_padded[dst_start:dst_end] = x_sorted[src_start:src_end]
                 router_weights_padded[dst_start:dst_end] = router_weights_sorted[src_start:src_end]
+                
+                # Track which padded positions correspond to real tokens
+                unpad_indices.extend(range(dst_start, dst_end))
         
-        return x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded
+        unpad_indices = torch.tensor(unpad_indices, dtype=torch.long, device=x_sorted.device)
+        
+        return x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded, unpad_indices
     
     def _create_sparse_indices(self, tokens_per_expert_padded):
         """Create row and column indices for sparse blocks (vectorized!)."""
@@ -269,75 +277,71 @@ class MoeMLP(nn.Module):
         batch_size, seq_len, n_embd = x.shape
         x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
         
-        router_weights, selected_experts = self._route_tokens(x_flat)
+        router_weights, selected_experts, router_logits = self._route_tokens(x_flat)
         
         x_sorted, selected_experts_sorted, router_weights_sorted, inv_indices = self._sort_by_expert(
             x_flat, router_weights, selected_experts
         )
         
-        x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded = self._pad_to_blocks(
+        x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded, unpad_indices = self._pad_to_blocks(
             x_sorted, router_weights_sorted, selected_experts_sorted
         )
         
         row_indices, weight_col_indices, output_col_indices = self._create_sparse_indices(tokens_per_expert_padded)
         
-        total_padded_tokens = cumsum_padded[-1].item()
-        block_sparse = torch.zeros(
-            (total_padded_tokens, self.d_ffn),
-            dtype=x.dtype, 
-            device=x.device
-        )
-        
-        stride_xm, stride_xk = x_padded.stride()
-        stride_wk, stride_wn = self.w1.stride()
-        stride_om, stride_on = block_sparse.stride()
-        num_blocks = len(row_indices)
-        if num_blocks > 0:
-            sdd_kernel[num_blocks,](
-                x_padded, self.w1, block_sparse,
-                row_indices, weight_col_indices, output_col_indices,
-                stride_xm, stride_xk,
-                stride_wk, stride_wn, 
-                stride_om, stride_on,
-                self.n_embd,
-                BLOCK_SIZE=self.block_size,
-                BLOCK_K=self.block_k
+        if len(row_indices) > 0:
+            total_padded_tokens = cumsum_padded[-1].item()
+            block_sparse = SDD.apply(
+                x_padded, self.w1, 
+                row_indices, weight_col_indices, output_col_indices
             )
+            
+            block_sparse = F.gelu(block_sparse)
+            expert_output = DSD.apply(
+                block_sparse, self.w2,
+                row_indices, weight_col_indices, output_col_indices,
+                self.block_size
+            )
+            
+            # Simply use the unpadding indices we computed during padding!
+            output_unpadded = expert_output[unpad_indices]
+            
+            # Apply router weights
+            output_weighted = output_unpadded * router_weights_sorted
+            
+            # Unpermute back to original token order
+            output = output_weighted[inv_indices]
+            
+            # Reshape back to original batch dimensions
+            output = rearrange(output, '(batch seq) hidden -> batch seq hidden', 
+                             batch=batch_size, seq=seq_len)
+        else:
+            # No tokens to process - return zeros
+            output = torch.zeros((batch_size, seq_len, self.n_embd), 
+                                dtype=x.dtype, device=x.device)
         
-        block_sparse = F.gelu(block_sparse)
-        expert_output = torch.zeros(
-            (total_padded_tokens,self.n_embd),
-            dtype=x.dtype,
-            device=x.device
-        )
-        num_token_blocks = len(row_indices)
-        num_hidden_blocks = triton.cdiv(self.n_embd, self.block_size)
-        stride_xm, stride_xk = block_sparse.stride()
-        stride_wk, stride_wn = self.w2.stride()
-        stride_om, stride_on = expert_output.stride()
-        dsd_kernel[(num_token_blocks,num_hidden_blocks)](
-            block_sparse, self.w2, expert_output,
-            row_indices_ptr=row_indices,
-            weight_row_indices_ptr=weight_col_indices, #w2 is d_ffn*n_embd *rows* so we can reuse the indices
-            stride_xm=stride_xm, stride_xk=stride_xk,
-            stride_wk=stride_wk, stride_wn=stride_wn,
-            stride_om=stride_om, stride_on=stride_on,
-            d_ffn=self.d_ffn, hidden_size=self.n_embd,
-            BLOCK_SIZE=self.block_size,
-            BLOCK_K=self.block_k,             
-        )
-        print(f"padded shape: {expert_output.shape}")
-        print(f"padded output:\n{expert_output}")
-        #get rid of the zeroes!
-        mask = (expert_output != 0).any(dim=1)
-        expert_output = expert_output[mask]
-        print(f"unpadded shape: {expert_output.shape}")
-        print(f"unpadded output:\n{expert_output}")
-        # expert_output = expert_output * router_weights_sorted
-
-        # TODO: Scale by router weights
-        # TODO: Unpermute back to original token order
-        return expert_output 
+        # Compute auxiliary losses
+        # Router z-loss: encourages router logits to stay small for stability
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+        
+        # TODO(human): Implement load balancing loss calculation
+        # You need to compute:
+        # 1. f_i = fraction of tokens routed to each expert
+        # 2. P_i = average routing probability for each expert
+        # 3. load_balance_loss = num_experts * sum(f_i * P_i)
+        # Available variables:
+        # - router_logits: (batch*seq, num_experts) raw logits
+        # - selected_experts: (batch*seq, num_experts_per_tok) which experts were selected
+        # - self.num_experts: total number of experts
+        # - self.num_experts_per_tok: how many experts each token uses (top-k)
+        
+        # Package auxiliary losses for the training script
+        aux_loss = {
+            'router_z_loss': router_z_loss,
+            'load_balance_loss': load_balance_loss,  # You'll define this above
+        }
+        
+        return output, aux_loss 
 class Block(nn.Module):
 
     def __init__(self, config):

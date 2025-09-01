@@ -3,37 +3,38 @@ import triton
 import triton.language as tl
 import triton.testing
 import os
+import math
 
 # Enable verbose Triton autotuning output unless explicitly disabled by the environment
 if os.environ.get("TRITON_PRINT_AUTOTUNING") is None:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 '''Note: Karpathy calls hidden_size the n_embd. ffn_hidden_size is 4*n_embd (or hidden size!)'''
 
-# @triton.autotune(
-#     configs=[
-#         # Small blocks for small batch sizes or debugging
-#         triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 16}),
-#         triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 32}),
-#         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 16}),
-#         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 32}),
-#         triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 64}),
-#         # Medium blocks
-#         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 16}),
-#         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 32}),
-#         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 64}),
-#         triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 128}),
-#         # Large blocks for large batch/hidden sizes
-#         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 32}),
-#         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 64}),
-#         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 128}),
-#         triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 256}),
-#         # Even larger for big models
-#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 64}),
-#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 128}),
-#         triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 256}),
-#     ],
-#     key=['hidden_size'],
-# )
+@triton.autotune(
+    configs=[
+        # Small blocks for small batch sizes or debugging
+        triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 64}),
+        # Medium blocks
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 128}),
+        # Large blocks for large batch/hidden sizes
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 256}),
+        # Even larger for big models
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 256}),
+    ],
+    key=['hidden_size', 'd_ffn'],
+)
 
 @triton.jit
 def sdd_kernel(
@@ -87,8 +88,35 @@ def sdd_kernel(
     output_col_offsets = output_col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = output_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
     
+    # Mask to prevent out-of-bounds access (compact storage may not align perfectly)
+    # No mask needed here as the compact storage is sized exactly for the blocks
     tl.store(output_ptrs, acc)
 
+@triton.autotune(
+    configs=[
+        # Small blocks for small batch sizes or debugging
+        triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 16, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 32, 'BLOCK_K': 64}),
+        # Medium blocks
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 16}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 64, 'BLOCK_K': 128}),
+        # Large blocks for large batch/hidden sizes
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 32}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_SIZE': 128, 'BLOCK_K': 256}),
+        # Even larger for big models
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 64}),
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 128}),
+        triton.Config({'BLOCK_SIZE': 256, 'BLOCK_K': 256}),
+    ],
+    key=['d_ffn', 'hidden_size'],
+)
 @triton.jit
 def dsd_kernel(
     x_ptr, # the block sparse matrix, but compact: total_padded_tokens x d_ffn
@@ -134,7 +162,9 @@ def dsd_kernel(
     output_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = output_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
 
-    tl.store(output_ptrs, acc)
+    # Add mask to prevent out-of-bounds writes
+    output_mask = (output_col_offsets < hidden_size)
+    tl.store(output_ptrs, acc, mask=output_mask)
 
 @triton.jit
 def sdd_backward_act_kernel(
@@ -313,6 +343,7 @@ def dsd_backward_act_kernel(
     output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
     output_col_offsets = output_col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = grad_act_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
+    # No mask needed - compact storage is sized exactly for the blocks
     tl.store(output_ptrs, acc)
 
 @triton.jit
@@ -393,3 +424,244 @@ def approx_gelu(x):
 @triton.jit
 def tanh(x):
     pass
+
+
+class SDD(torch.autograd.Function):
+    """Sparse-Dense-Dense operation for MoE first layer (X @ W1)
+    
+    Computes Y = X @ W1 where:
+    - X is dense input (batch_tokens, hidden_size)
+    - W1 is dense weights (hidden_size, num_experts * d_ffn)
+    - Y is sparse output stored compactly based on expert assignment
+    """
+    
+    @staticmethod
+    def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=64):
+        """
+        Args:
+            x: Dense input tensor (num_padded_tokens, hidden_size)
+            w1: Dense weight tensor (hidden_size, num_experts * d_ffn)
+            row_indices: Which token blocks to process
+            weight_col_indices: Which expert each block belongs to (for selecting W1 slice)
+            output_col_indices: Which column in compact storage
+            block_size: Block size for Triton kernel
+        
+        Returns:
+            Sparse output in compact form (num_padded_tokens, d_ffn_compact)
+        """
+        batch_size, hidden_size = x.shape
+        num_experts_times_dffn = w1.shape[1]
+        num_blocks = len(row_indices)
+        
+        # Determine output size based on unique output columns
+        max_output_col = output_col_indices.max().item() if len(output_col_indices) > 0 else 0
+        output_width = (max_output_col + 1) * block_size
+        
+        # Allocate output tensor (compact storage)
+        output = torch.zeros((batch_size, output_width), dtype=x.dtype, device=x.device)
+        
+        # Configure grid
+        grid = (num_blocks,)
+        
+        # Launch kernel
+        sdd_kernel[grid](
+            x, w1, output,
+            row_indices, weight_col_indices, output_col_indices,
+            x.stride(0), x.stride(1),
+            w1.stride(0), w1.stride(1),
+            output.stride(0), output.stride(1),
+            hidden_size,
+            # BLOCK_SIZE=block_size,
+            # BLOCK_K=min(block_size, hidden_size),
+        )
+        '''save the all the things we need for our backward passes: tensors, integer inputs
+           the current plan is to transpose in the backward pass since torch transposes are cheap to save the vram,
+           but we'll have to see how it works out '''
+        ctx.save_for_backward(x, w1, row_indices, weight_col_indices, output_col_indices)
+        ctx.block_size = block_size
+        ctx.hidden_size = hidden_size
+        ctx.d_ffn = output_width
+        
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Computes gradients for x and w1 given grad_output
+        
+        Args:
+            grad_output: Gradient w.r.t. sparse output (num_padded_tokens, d_ffn_compact)
+        
+        Returns:
+            Gradients for: x, w1, row_indices, weight_col_indices, output_col_indices, block_size
+        """
+        # Retrieve saved tensors and metadata
+        x, w1, row_indices, weight_col_indices, output_col_indices = ctx.saved_tensors
+        block_size = ctx.block_size
+        hidden_size = ctx.hidden_size
+        d_ffn = ctx.d_ffn
+
+        x_t, w1_t = x.t(), w1.t()
+
+        num_blocks = len(row_indices)
+        hidden_tiles = math.ceil(hidden_size / block_size)
+        d_ffn_tiles = math.ceil(d_ffn / block_size)
+
+        x_grid = (num_blocks, hidden_tiles) # 2 pids
+        w1_grid = (num_blocks, hidden_tiles, d_ffn_tiles) # 3 pids
+        
+        # Allocate gradient tensors
+        grad_x = torch.zeros_like(x) 
+        grad_w1 = torch.zeros_like(w1)
+
+        sdd_backward_act_kernel[x_grid](
+            grad_output,         # grad_sparse_ptr
+            w1_t,               # w1_t_ptr
+            grad_x,             # grad_input_ptr
+            row_indices,        # row_indices_ptr
+            weight_col_indices, # weight_col_indices_ptr
+            output_col_indices, # output_col_indices_ptr
+            grad_output.stride(0), grad_output.stride(1),  # stride_gm, stride_gk
+            w1_t.stride(0), w1_t.stride(1),                # stride_wk, stride_wn
+            grad_x.stride(0), grad_x.stride(1),            # stride_om, stride_on
+            d_ffn, hidden_size,                             # dimensions
+            # BLOCK_SIZE=block_size,
+            # BLOCK_K=min(block_size, d_ffn),
+        )
+        
+        expert_indices = weight_col_indices  # Assuming these are the same
+        
+        sdd_backward_weight_kernel[w1_grid](
+            x_t,                # input_t_ptr
+            grad_output,        # grad_sparse_ptr
+            grad_w1,            # grad_weight_ptr
+            row_indices,        # row_indices_ptr
+            expert_indices,     # expert_indices_ptr (MISSING!)
+            output_col_indices, # output_col_indices_ptr
+            x_t.stride(0), x_t.stride(1),           # stride_xm, stride_xk
+            grad_output.stride(0), grad_output.stride(1),  # stride_gm, stride_gk
+            grad_w1.stride(0), grad_w1.stride(1),   # stride_wm, stride_wn
+            hidden_size, d_ffn,                     # dimensions
+            # BLOCK_SIZE=block_size,
+        )
+
+        
+        return grad_x, grad_w1, None, None, None, None
+
+
+class DSD(torch.autograd.Function):
+    """Dense-Sparse-Dense operation for MoE second layer (X @ W2)
+    
+    Computes Y = X @ W2 where:
+    - X is sparse input in compact form (batch_tokens, d_ffn_compact)
+    - W2 is dense weights (num_experts * d_ffn, hidden_size)
+    - Y is dense output (batch_tokens, hidden_size)
+    """
+    
+    @staticmethod
+    def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=64):
+        """
+        Args:
+            x: Sparse input tensor in compact form (num_padded_tokens, d_ffn_compact)
+            w2: Dense weight tensor (num_experts * d_ffn, hidden_size)
+            row_indices: Which token blocks to process
+            weight_row_indices: Which expert weights to use
+            output_col_indices: Position in compact storage (from SDD)
+            block_size: Block size for Triton kernel
+        
+        Returns:
+            Dense output (num_padded_tokens, hidden_size)
+        """
+        batch_size = x.shape[0]
+        d_ffn = x.shape[1]
+        hidden_size = w2.shape[1]
+        num_blocks = len(row_indices)
+        
+        # Allocate dense output
+        output = torch.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device)
+        
+        # Configure grid - need to tile over hidden_size dimension
+        hidden_tiles = math.ceil(hidden_size / block_size)
+        grid = (num_blocks, hidden_tiles)
+        
+        # Launch kernel
+        dsd_kernel[grid](
+            x, w2, output,
+            row_indices, weight_row_indices,
+            x.stride(0), x.stride(1),
+            w2.stride(0), w2.stride(1),
+            output.stride(0), output.stride(1),
+            d_ffn, hidden_size,
+            # BLOCK_SIZE=block_size,
+            # BLOCK_K=min(block_size, d_ffn),
+        )
+        
+        ctx.save_for_backward(x, w2, row_indices, weight_row_indices, output_col_indices)
+        ctx.block_size = block_size
+        ctx.hidden_size = hidden_size
+        ctx.d_ffn = d_ffn
+        
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        Computes gradients for x and w2 given grad_output
+        
+        Args:
+            grad_output: Gradient w.r.t. dense output (num_padded_tokens, hidden_size)
+        
+        Returns:
+            Gradients for: x, w2, row_indices, weight_row_indices, output_col_indices, block_size
+        """
+        # Retrieve saved tensors
+        # TODO(human): Retrieve the tensors you saved in forward
+        x, w2, row_indices, weight_row_indices, output_col_indices = ctx.saved_tensors
+        block_size = ctx.block_size
+        hidden_size = ctx.hidden_size
+        d_ffn = ctx.d_ffn
+
+        x_t = x.t()
+        w2_t = w2.t()
+
+        num_blocks = len(row_indices)
+        hidden_tiles = math.ceil(hidden_size / block_size)
+        d_ffn_tiles = math.ceil(d_ffn / block_size)
+
+        x_grid = (num_blocks,)
+        w2_grid = (num_blocks, d_ffn_tiles, hidden_tiles)
+
+        grad_x = torch.zeros_like(x) 
+        grad_w2 = torch.zeros_like(w2)
+
+        dsd_backward_act_kernel[x_grid](
+            grad_output,         # grad_output_ptr
+            w2_t,               # w2_t_ptr
+            grad_x,             # grad_act_ptr (output)
+            row_indices,        # row_indices_ptr
+            weight_row_indices, # weight_col_indices_ptr (which expert)
+            output_col_indices, # output_col_indices_ptr (position in compact)
+            grad_output.stride(0), grad_output.stride(1),  # stride_gm, stride_gk
+            w2_t.stride(0), w2_t.stride(1),                # stride_wk, stride_wn
+            grad_x.stride(0), grad_x.stride(1),            # stride_om, stride_on
+            hidden_size,                                    # hidden_size dimension
+            # BLOCK_SIZE=block_size,
+            # BLOCK_K=min(block_size, hidden_size),
+        )
+        
+        expert_indices = weight_row_indices
+
+        dsd_backward_weight_kernel[w2_grid](
+            x_t,                # sparse_act_t_ptr (already transposed)
+            grad_output,        # grad_output_ptr
+            grad_w2,            # grad_weight_ptr (output)
+            row_indices,        # row_indices_ptr
+            expert_indices,     # expert_indices_ptr
+            x_t.stride(0), x_t.stride(1),           # stride_am, stride_ak
+            grad_output.stride(0), grad_output.stride(1),  # stride_gm, stride_gk
+            grad_w2.stride(0), grad_w2.stride(1),   # stride_wm, stride_wn
+            d_ffn, hidden_size,                     # dimensions
+            # BLOCK_SIZE=block_size,
+        )
+        
+        return grad_x, grad_w2, None, None, None, None
