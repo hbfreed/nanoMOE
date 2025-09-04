@@ -140,25 +140,18 @@ class MoeMLPForLoop(nn.Module):
         return output.view(batch_size, seq_len, hidden_dim), router_logits
 
 class MoeMLP(nn.Module):
-    def __init__(self, 
-                 num_experts: int = 8,
-                 num_experts_per_tok: int = 2,
-                 n_embd: int = 32,
-                 norm_topk_prob: bool = True,
-                 block_size: int = 64,
-                 block_k: int = 64):
+    
+    def __init__(self, config):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.norm_topk_prob = norm_topk_prob
-        self.n_embd = n_embd
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
+        self.n_embd = config.n_embd
         
-        # Each expert should have the full FFN size (4 * n_embd)
-        d_ffn = 4 * self.n_embd  # <-- Remove the division!
-        self.d_ffn = ((d_ffn + block_size - 1) // block_size) * block_size
-        
-        self.block_size = block_size
-        self.block_k = block_k
+        d_ffn = 4 * self.n_embd // self.num_experts_per_tok
+        self.block_size = 64  # Triton kernel block size, NOT sequence length!
+        self.d_ffn = ((d_ffn + self.block_size - 1) // self.block_size) * self.block_size
+        self.block_k = getattr(config, 'block_k', 64)
         
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
@@ -199,16 +192,20 @@ class MoeMLP(nn.Module):
     
     def _pad_to_blocks(self, x_sorted, router_weights_sorted, selected_experts_sorted):
         """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
-        tokens_per_expert = torch.bincount(
-            selected_experts_sorted, 
-            minlength=self.num_experts
+        # Use scatter_add instead of bincount for torch.compile compatibility
+        tokens_per_expert = torch.zeros(
+            self.num_experts, 
+            dtype=torch.long,  # int64 for counts
+            device=selected_experts_sorted.device
         )
+        ones = torch.ones_like(selected_experts_sorted, dtype=torch.long)  # Same dtype as target
+        tokens_per_expert.scatter_add_(0, selected_experts_sorted, ones)
         
         tokens_per_expert_padded = ((tokens_per_expert + self.block_size - 1) // self.block_size) * self.block_size
         
         cumsum_original = F.pad(tokens_per_expert.cumsum(0), (1, 0))
         cumsum_padded = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))
-        total_padded_tokens = cumsum_padded[-1].item()
+        total_padded_tokens = cumsum_padded[-1]  # Keep as tensor, not .item()
         x_padded = torch.zeros(
             (total_padded_tokens, self.n_embd), 
             dtype=x_sorted.dtype, 
@@ -243,7 +240,7 @@ class MoeMLP(nn.Module):
         return x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded, unpad_indices
     
     def _create_sparse_indices(self, tokens_per_expert_padded):
-        """Create row and column indices for sparse blocks (vectorized!)."""
+        """Create row and column indices for sparse blocks."""
         device = tokens_per_expert_padded.device
         
         num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
@@ -290,10 +287,11 @@ class MoeMLP(nn.Module):
         row_indices, weight_col_indices, output_col_indices = self._create_sparse_indices(tokens_per_expert_padded)
         
         if len(row_indices) > 0:
-            total_padded_tokens = cumsum_padded[-1].item()
+            # total_padded_tokens already computed above as a tensor
             block_sparse = SDD.apply(
                 x_padded, self.w1, 
-                row_indices, weight_col_indices, output_col_indices
+                row_indices, weight_col_indices, output_col_indices,
+                self.block_size
             )
             
             block_sparse = F.gelu(block_sparse)
@@ -312,6 +310,26 @@ class MoeMLP(nn.Module):
             # Unpermute back to original token order
             output = output_weighted[inv_indices]
             
+            # Combine outputs from multiple experts per token using scatter_add
+            # Since each token was sent to num_experts_per_tok experts,
+            # we need to sum their weighted contributions
+            num_tokens = batch_size * seq_len
+            
+            # inv_indices maps from sorted positions back to original duplicated positions
+            # We need to map to the original token indices (0 to num_tokens-1)
+            original_token_indices = inv_indices % num_tokens
+            
+            # Use scatter_add to efficiently combine all expert outputs at once
+            # This avoids both loops and unnecessary memory allocation
+            combined_output = torch.zeros((num_tokens, self.n_embd), 
+                                         dtype=output.dtype, device=output.device)
+            combined_output.scatter_add_(
+                0,
+                original_token_indices.unsqueeze(-1).expand(-1, self.n_embd),
+                output
+            )
+            output = combined_output
+            
             # Reshape back to original batch dimensions
             output = rearrange(output, '(batch seq) hidden -> batch seq hidden', 
                              batch=batch_size, seq=seq_len)
@@ -324,24 +342,29 @@ class MoeMLP(nn.Module):
         # Router z-loss: encourages router logits to stay small for stability
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
         
-        # TODO(human): Implement load balancing loss calculation
-        # You need to compute:
-        # 1. f_i = fraction of tokens routed to each expert
-        # 2. P_i = average routing probability for each expert
-        # 3. load_balance_loss = num_experts * sum(f_i * P_i)
-        # Available variables:
-        # - router_logits: (batch*seq, num_experts) raw logits
-        # - selected_experts: (batch*seq, num_experts_per_tok) which experts were selected
-        # - self.num_experts: total number of experts
-        # - self.num_experts_per_tok: how many experts each token uses (top-k)
+        # Load balance loss: encourages uniform distribution across experts
+        p_i = F.softmax(router_logits, dim=-1)  # Shape: (batch*seq, num_experts)
+        p_i = p_i.mean(dim=0)  # Average probability per expert: (num_experts,)
+        
+        if len(selected_experts) > 0:
+            experts_flat = selected_experts.flatten()
+            # Use scatter_add instead of bincount for torch.compile compatibility
+            f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
+            ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
+            f_i.scatter_add_(0, experts_flat, ones)
+            load_balance_loss = self.num_experts * (f_i @ p_i)
+        else:
+            # No tokens routed - no imbalance possible
+            load_balance_loss = torch.tensor(0.0, device=x.device)
+            f_i = torch.zeros(self.num_experts, device=x.device)
         
         # Package auxiliary losses for the training script
         aux_loss = {
             'router_z_loss': router_z_loss,
-            'load_balance_loss': load_balance_loss,  # You'll define this above
+            'load_balance_loss': load_balance_loss,
         }
         
-        return output, aux_loss 
+        return output, aux_loss, f_i 
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -349,25 +372,25 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        if config.use_moe:
+            self.mlp = MoeMLP(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        mlp_out = self.mlp(self.ln_2(x))
 
-class MoeBlock(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.moe_mlp = MoeMLP(config)  # Replace mlp with moe_mlp
-        
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.moe_mlp(self.ln_2(x))
-        return x
+        if isinstance(mlp_out, tuple): #handle moes and regular MLP
+            if len(mlp_out) == 3:  # MoeMLP returns output, aux_loss, f_i
+                mlp_x, aux_loss, f_i = mlp_out
+            else:  # Might be old format with just output, aux_loss
+                mlp_x, aux_loss = mlp_out
+                f_i = None
+        else:
+            mlp_x, aux_loss, f_i = mlp_out, None, None
+        x = x + mlp_x
+        return x, aux_loss, f_i
     
 @dataclass
 class GPTConfig:
@@ -378,6 +401,11 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_moe: bool = False
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1
+    block_k: int = 64  # Block size for Triton kernels in MoE
 
 class GPT(nn.Module):
 
@@ -441,20 +469,54 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        
+        combined_aux_loss = None
+        aux_loss_count = 0
+        all_expert_usage = []  # Collect expert usage from all layers
+        
         for block in self.transformer.h:
-            x = block(x)
+            block_out = block(x)
+            
+            # Handle different return formats
+            if len(block_out) == 3:
+                x, aux_loss, f_i = block_out
+                if f_i is not None:
+                    all_expert_usage.append(f_i)
+            else:
+                x, aux_loss = block_out
+
+            if aux_loss is not None: #accumulate the aux
+                if combined_aux_loss is None:
+                    combined_aux_loss = {k: v.clone() for k, v in aux_loss.items()}
+                else:
+                    for key in aux_loss:
+                        combined_aux_loss[key] += aux_loss[key]
+                aux_loss_count += 1
+        
+        if combined_aux_loss is not None and aux_loss_count > 0:
+            for key in combined_aux_loss:
+                combined_aux_loss[key] /= aux_loss_count #average out the accumulated total
+        
+        # Average expert usage across layers
+        if all_expert_usage:
+            avg_expert_usage = torch.stack(all_expert_usage).mean(dim=0)
+            combined_aux_loss['expert_usage'] = avg_expert_usage
+
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            if combined_aux_loss is not None: # add in the aux losses scaled by their weights
+                loss = loss + 0.01 * combined_aux_loss['load_balance_loss'] + 0.001 * combined_aux_loss['router_z_loss']
+            
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, combined_aux_loss  # Return aux losses for logging
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

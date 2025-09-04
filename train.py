@@ -145,7 +145,16 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout)
+# Add MoE parameters if they exist in globals (from config file)
+if 'use_moe' in globals():
+    model_args['use_moe'] = use_moe
+    if use_moe:  # Only add other MoE params if MoE is enabled
+        model_args['num_experts'] = num_experts
+        model_args['num_experts_per_tok'] = num_experts_per_tok
+        model_args['norm_topk_prob'] = norm_topk_prob
+        model_args['block_k'] = block_k
+        print(f"MoE enabled with {num_experts} experts, {num_experts_per_tok} experts per token")
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -203,9 +212,14 @@ checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
+    # Check if using MoE - if so, skip compilation due to dynamic shapes
+    if 'use_moe' in globals() and use_moe:
+        print("Skipping compilation for MoE model (dynamic shapes incompatible with torch.compile)")
+        # torch.compile(model, fullgraph=True)
+    else:
+        print("compiling the model... (takes a ~minute)")
+        unoptimized_model = model
+        model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -218,12 +232,23 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        load_balance_losses = torch.zeros(eval_iters)
+        router_z_losses = torch.zeros(eval_iters)
+        
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss, aux_losses = model(X, Y)
             losses[k] = loss.item()
+            
+            if aux_losses is not None:
+                load_balance_losses[k] = aux_losses['load_balance_loss'].item()
+                router_z_losses[k] = aux_losses['router_z_loss'].item()
+        
         out[split] = losses.mean()
+        out[f'{split}_load_balance'] = load_balance_losses.mean()
+        out[f'{split}_router_z'] = router_z_losses.mean()
+    
     model.train()
     return out
 
@@ -264,13 +289,19 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if 'train_load_balance' in losses:
+                log_dict["train/load_balance_loss"] = losses['train_load_balance']
+                log_dict["val/load_balance_loss"] = losses['val_load_balance']
+                log_dict["train/router_z_loss"] = losses['train_router_z']
+                log_dict["val/router_z_loss"] = losses['val_router_z']
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -289,6 +320,7 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    combined_aux_loss = None  # Initialize outside the loop
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -297,8 +329,11 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss, aux_loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # Keep the last aux_loss for logging (they should be similar across micro steps)
+            if aux_loss is not None:
+                combined_aux_loss = aux_loss
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -325,6 +360,24 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log and combined_aux_loss is not None:
+            log_dict = {
+                "iter": iter_num,
+                "train/load_balance_loss_step": combined_aux_loss['load_balance_loss'].item(),
+                "train/router_z_loss_step": combined_aux_loss['router_z_loss'].item(),
+            }
+            if 'expert_usage' in combined_aux_loss:
+                expert_usage = combined_aux_loss['expert_usage']
+                for i, usage in enumerate(expert_usage):
+                    log_dict[f"expert_usage/expert_{i}"] = usage.item()
+                
+                # Monitor for expert collapse
+                max_usage = expert_usage.max().item()
+                log_dict["expert_usage/max_usage"] = max_usage
+                if max_usage > 0.5:
+                    print(f"WARNING: Expert collapse detected! Expert {expert_usage.argmax().item()} has {max_usage:.1%} of tokens")
+            
+            wandb.log(log_dict)
     iter_num += 1
     local_iter_num += 1
 

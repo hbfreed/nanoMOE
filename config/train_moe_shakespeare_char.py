@@ -1,7 +1,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-shakespeare-char'
+out_dir = 'out-moe-shakespeare-char'
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -11,7 +11,7 @@ always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
 wandb_project = 'moe-test'
-wandb_run_name = 'mini-dense-gpt'
+wandb_run_name = 'mini-moe-gpt'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
@@ -36,5 +36,9 @@ warmup_iters = 100 # not super necessary potentially
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
 
-# MoE configuration (disabled for standard GPT-2)
-use_moe = False
+# MoE configuration
+use_moe = True
+num_experts = 8
+num_experts_per_tok = 2
+norm_topk_prob = True
+block_k = 64

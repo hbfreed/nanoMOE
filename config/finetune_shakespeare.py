@@ -23,3 +23,6 @@ max_iters = 20
 # finetune at constant LR
 learning_rate = 3e-5
 decay_lr = False
+
+# MoE configuration (disabled for standard GPT-2)
+use_moe = False
