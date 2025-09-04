@@ -277,6 +277,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+combined_aux_loss = None  # Initialize for first eval at iter 0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -301,6 +302,23 @@ while True:
                 log_dict["val/load_balance_loss"] = losses['val_load_balance']
                 log_dict["train/router_z_loss"] = losses['train_router_z']
                 log_dict["val/router_z_loss"] = losses['val_router_z']
+            
+            # Log step-level auxiliary losses if available
+            if combined_aux_loss is not None:
+                log_dict["train/load_balance_loss_step"] = combined_aux_loss['load_balance_loss'].item()
+                log_dict["train/router_z_loss_step"] = combined_aux_loss['router_z_loss'].item()
+                
+                if 'expert_usage' in combined_aux_loss:
+                    expert_usage = combined_aux_loss['expert_usage']
+                    for i, usage in enumerate(expert_usage):
+                        log_dict[f"expert_usage/expert_{i}"] = usage.item()
+                    
+                    # Monitor for expert collapse
+                    max_usage = expert_usage.max().item()
+                    log_dict["expert_usage/max_usage"] = max_usage
+                    if max_usage > 0.5:
+                        print(f"WARNING: Expert collapse detected! Expert {expert_usage.argmax().item()} has {max_usage:.1%} of tokens")
+            
             wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -320,7 +338,6 @@ while True:
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
-    combined_aux_loss = None  # Initialize outside the loop
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -360,24 +377,6 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-        if wandb_log and combined_aux_loss is not None:
-            log_dict = {
-                "iter": iter_num,
-                "train/load_balance_loss_step": combined_aux_loss['load_balance_loss'].item(),
-                "train/router_z_loss_step": combined_aux_loss['router_z_loss'].item(),
-            }
-            if 'expert_usage' in combined_aux_loss:
-                expert_usage = combined_aux_loss['expert_usage']
-                for i, usage in enumerate(expert_usage):
-                    log_dict[f"expert_usage/expert_{i}"] = usage.item()
-                
-                # Monitor for expert collapse
-                max_usage = expert_usage.max().item()
-                log_dict["expert_usage/max_usage"] = max_usage
-                if max_usage > 0.5:
-                    print(f"WARNING: Expert collapse detected! Expert {expert_usage.argmax().item()} has {max_usage:.1%} of tokens")
-            
-            wandb.log(log_dict)
     iter_num += 1
     local_iter_num += 1
 

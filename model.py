@@ -438,6 +438,8 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        if config.use_moe:
+            print("active parameters per token: %.2fM" % (self.get_active_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         """
@@ -450,6 +452,30 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
+    
+    def get_active_num_params(self, non_embedding=True):
+        """
+        Return the number of active parameters per token in MoE models.
+        For MoE, only num_experts_per_tok out of num_experts are active.
+        """
+        if not self.config.use_moe:
+            return self.get_num_params(non_embedding)
+        
+        total_params = self.get_num_params(non_embedding)
+        
+        # Calculate MLP params (all experts)
+        mlp_params = 0
+        for name, param in self.named_parameters():
+            if 'mlp' in name and ('w1' in name or 'w2' in name or 'experts' in name):
+                mlp_params += param.numel()
+        
+        # Active MLP params = mlp_params * (num_experts_per_tok / num_experts)
+        active_mlp_params = mlp_params * (self.config.num_experts_per_tok / self.config.num_experts)
+        
+        # Active total = total - all_mlp + active_mlp
+        active_params = total_params - mlp_params + active_mlp_params
+        
+        return active_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -613,7 +639,7 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        """ estimate model flops utilization (MFU) based on GPU-specific peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -622,9 +648,39 @@ class GPT(nn.Module):
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        
+        # Detect GPU and use appropriate peak FLOPS
+        # Using Tensor Core FP16/BF16 performance (following Karpathy's approach with A100)
+        gpu_flops_map = {
+            'A100': 312e12,        # A100 BF16 tensor core peak: 312 TFLOPS  
+            'RTX 3090': 71e12,     # RTX 3090 FP16 tensor core (dense): 71 TFLOPS
+            'RTX 4090': 82.58e12,  # RTX 4090 FP16 tensor core: 82.58 TFLOPS
+            'V100': 125e12,        # V100 FP16 tensor core: 125 TFLOPS
+            'H100': 989e12,        # H100 FP16 tensor core: 989 TFLOPS
+            'RTX 3080': 59e12,     # RTX 3080 FP16 tensor core: 59 TFLOPS
+            'RTX 3070': 40e12,     # RTX 3070 FP16 tensor core: 40 TFLOPS
+            'RTX 3060': 25e12,     # RTX 3060 FP16 tensor core: 25 TFLOPS
+        }
+        
+        # Get GPU name
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            # Match known GPU types
+            flops_promised = None
+            for gpu_key in gpu_flops_map:
+                if gpu_key in gpu_name:
+                    flops_promised = gpu_flops_map[gpu_key]
+                    break
+            
+            if flops_promised is None:
+                # Default to A100 if GPU not recognized, but warn
+                print(f"Warning: Unknown GPU '{gpu_name}', defaulting to A100 FLOPS for MFU calculation")
+                flops_promised = 312e12
+        else:
+            flops_promised = 312e12  # Default to A100 if no CUDA
+        
+        # express our flops throughput as ratio of GPU's peak flops
         flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
