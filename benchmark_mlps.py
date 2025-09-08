@@ -521,7 +521,7 @@ def main():
                        help='Run PyTorch profiling after benchmarking')
     parser.add_argument('--cprofile', action='store_true',
                        help='Run cProfile after benchmarking')
-    parser.add_argument('--dtype', type=str, default='bf16',
+    parser.add_argument('--dtype', type=str, default='fp16',
                        choices=['fp32', 'fp16', 'bf16'],
                        help='Data type to use (default: bf16)')
     parser.add_argument('--device', type=str, default='cuda:2',

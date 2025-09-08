@@ -47,7 +47,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+n_ctx = 1024
 # model
 n_layer = 12
 n_head = 12
@@ -98,7 +98,7 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * n_ctx
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
@@ -120,9 +120,9 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    ix = torch.randint(len(data) - n_ctx, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+n_ctx]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+n_ctx]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -144,7 +144,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, n_ctx=n_ctx,
                   bias=bias, vocab_size=None, dropout=dropout)
 # Add MoE parameters if they exist in globals (from config file)
 if 'use_moe' in globals():
@@ -172,7 +172,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'n_ctx', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = GPTConfig(**model_args)
@@ -193,12 +193,12 @@ elif init_from.startswith('gpt2'):
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'n_ctx', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+if n_ctx < model.config.n_ctx:
+    model.crop_block_size(n_ctx)
+    model_args['n_ctx'] = n_ctx # so that the checkpoint will have the right value
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -212,14 +212,9 @@ checkpoint = None # free up memory
 
 # compile the model
 if compile:
-    # Check if using MoE - if so, skip compilation due to dynamic shapes
-    if 'use_moe' in globals() and use_moe:
-        print("Skipping compilation for MoE model (dynamic shapes incompatible with torch.compile)")
-        # torch.compile(model, fullgraph=True)
-    else:
-        print("compiling the model... (takes a ~minute)")
-        unoptimized_model = model
-        model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:
@@ -232,6 +227,7 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        ce_losses = torch.zeros(eval_iters)
         load_balance_losses = torch.zeros(eval_iters)
         router_z_losses = torch.zeros(eval_iters)
         
@@ -244,8 +240,15 @@ def estimate_loss():
             if aux_losses is not None:
                 load_balance_losses[k] = aux_losses['load_balance_loss'].item()
                 router_z_losses[k] = aux_losses['router_z_loss'].item()
+                if 'ce_loss' in aux_losses:
+                    ce_losses[k] = aux_losses['ce_loss'].item()
+                else:
+                    ce_losses[k] = loss.item()  # For dense models, total loss is CE loss
+            else:
+                ce_losses[k] = loss.item()  # For dense models, total loss is CE loss
         
         out[split] = losses.mean()
+        out[f'{split}_ce'] = ce_losses.mean()
         out[f'{split}_load_balance'] = load_balance_losses.mean()
         out[f'{split}_router_z'] = router_z_losses.mean()
     
@@ -288,12 +291,14 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, train CE {losses['train_ce']:.4f}, val CE {losses['val_ce']:.4f}")
         if wandb_log:
             log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/ce_loss": losses['train_ce'],
+                "val/ce_loss": losses['val_ce'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
@@ -376,7 +381,13 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        
+        # Log cross-entropy loss separately if available
+        if combined_aux_loss is not None and 'ce_loss' in combined_aux_loss:
+            ce_lossf = combined_aux_loss['ce_loss'].item() * gradient_accumulation_steps
+            print(f"iter {iter_num}: loss {lossf:.4f}, ce_loss {ce_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        else:
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

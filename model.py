@@ -49,8 +49,8 @@ class CausalSelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            self.register_buffer("bias", torch.tril(torch.ones(config.n_ctx, config.n_ctx))
+                                        .view(1, 1, config.n_ctx, config.n_ctx))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -120,7 +120,7 @@ class MoeMLPForLoop(nn.Module):
 
         if self.norm_topk_prob:
             router_weights /= router_weights.sum(dim=-1, keepdim=True) #normalize to 1 if we have normalization on
-        router_weights.to(x.dtype)
+        router_weights = router_weights.to(x.dtype)
 
         output = torch.zeros_like(x_flat)
 
@@ -137,7 +137,33 @@ class MoeMLPForLoop(nn.Module):
                 current_output = self.experts[expert_idx](current_state) * router_weights[top_x, idx, None]
                 output.index_add_(0, top_x, current_output.to(x.dtype))
         
-        return output.view(batch_size, seq_len, hidden_dim), router_logits
+        # Compute auxiliary losses
+        # Router z-loss: encourages router logits to stay small for stability
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+        
+        # Load balance loss: encourages uniform distribution across experts
+        p_i = F.softmax(router_logits, dim=-1)  # Shape: (batch*seq, num_experts)
+        p_i = p_i.mean(dim=0)  # Average probability per expert: (num_experts,)
+        
+        if len(selected_experts) > 0:
+            experts_flat = selected_experts.flatten()
+            # Use scatter_add for torch.compile compatibility
+            f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
+            ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
+            f_i.scatter_add_(0, experts_flat, ones)
+            load_balance_loss = self.num_experts * (f_i @ p_i)
+        else:
+            # No tokens routed - no imbalance possible
+            load_balance_loss = torch.tensor(0.0, device=x.device)
+            f_i = torch.zeros(self.num_experts, device=x.device)
+        
+        # Package auxiliary losses for the training script
+        aux_loss = {
+            'router_z_loss': router_z_loss,
+            'load_balance_loss': load_balance_loss,
+        }
+        
+        return output.view(batch_size, seq_len, hidden_dim), aux_loss, f_i
 
 class MoeMLP(nn.Module):
     
@@ -147,11 +173,12 @@ class MoeMLP(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         self.n_embd = config.n_embd
+        self.seq_len = config.n_ctx #sequence length/context length
         
         d_ffn = 4 * self.n_embd // self.num_experts_per_tok
-        self.block_size = 64  # Triton kernel block size, NOT sequence length!
+        self.block_size = config.block_size  # Triton kernel block size, NOT sequence length!
         self.d_ffn = ((d_ffn + self.block_size - 1) // self.block_size) * self.block_size
-        self.block_k = getattr(config, 'block_k', 64)
+        self.block_k = config.block_k
         
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
@@ -190,83 +217,87 @@ class MoeMLP(nn.Module):
         
         return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
     
-    def _pad_to_blocks(self, x_sorted, router_weights_sorted, selected_experts_sorted):
+    def _pad_to_blocks(self, x_sorted, selected_experts_sorted):
         """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
-        # Use scatter_add instead of bincount for torch.compile compatibility
-        tokens_per_expert = torch.zeros(
-            self.num_experts, 
-            dtype=torch.long,  # int64 for counts
-            device=selected_experts_sorted.device
-        )
-        ones = torch.ones_like(selected_experts_sorted, dtype=torch.long)  # Same dtype as target
-        tokens_per_expert.scatter_add_(0, selected_experts_sorted, ones)
-        
-        tokens_per_expert_padded = ((tokens_per_expert + self.block_size - 1) // self.block_size) * self.block_size
-        
-        cumsum_original = F.pad(tokens_per_expert.cumsum(0), (1, 0))
-        cumsum_padded = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))
-        total_padded_tokens = cumsum_padded[-1]  # Keep as tensor, not .item()
-        x_padded = torch.zeros(
-            (total_padded_tokens, self.n_embd), 
-            dtype=x_sorted.dtype, 
-            device=x_sorted.device
-        )
-        router_weights_padded = torch.zeros(
-            (total_padded_tokens, 1), 
-            dtype=router_weights_sorted.dtype, 
-            device=router_weights_sorted.device
-        )
-        
-        # Build unpadding indices while we're padding
-        unpad_indices = []
-        
-        for exp_id in range(self.num_experts):
-            n_tokens = tokens_per_expert[exp_id].item()
-            if n_tokens > 0:
-                src_start = cumsum_original[exp_id].item()
-                src_end = cumsum_original[exp_id + 1].item()
-                
-                dst_start = cumsum_padded[exp_id].item()
-                dst_end = dst_start + n_tokens
-                
-                x_padded[dst_start:dst_end] = x_sorted[src_start:src_end]
-                router_weights_padded[dst_start:dst_end] = router_weights_sorted[src_start:src_end]
-                
-                # Track which padded positions correspond to real tokens
-                unpad_indices.extend(range(dst_start, dst_end))
-        
-        unpad_indices = torch.tensor(unpad_indices, dtype=torch.long, device=x_sorted.device)
-        
-        return x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded, unpad_indices
-    
+        import torch
+        import torch.nn.functional as F
+
+        device = x_sorted.device
+        n = x_sorted.shape[0]
+        d = x_sorted.shape[-1]
+        e = self.num_experts
+        b = self.block_size  # Triton token-block size (NOT seq len)
+
+        # Upper-bound capacity in *blocks* based only on (n,e,b) → compile-safe
+        m = min(n, e)
+        max_blocks = m + (n - m) // b
+        capacity_tokens = max_blocks * b
+
+        # Per-expert counts via scatter_add (compile-safe; avoids bincount)
+        counts = torch.zeros(e, dtype=torch.long, device=device)
+        ones = torch.ones_like(selected_experts_sorted, dtype=torch.long)
+        counts.scatter_add_(0, selected_experts_sorted, ones)
+
+        # Round each expert up to a multiple of b
+        tokens_per_expert_padded = ((counts + b - 1) // b) * b
+
+        # Exclusive-prefix sums (orig vs padded) for placement
+        off_orig = F.pad(counts.cumsum(0), (1, 0))              # [e+1]
+        off_pad  = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))  # [e+1]
+
+        # Allocate fixed capacity once; the tail is never indexed
+        x_padded = x_sorted.new_zeros((capacity_tokens, d))
+
+        # Map each sorted token to its padded position
+        token_idx = torch.arange(n, device=device)
+        idx_within_expert = token_idx - off_orig[selected_experts_sorted]
+        unpad_indices = idx_within_expert + off_pad[selected_experts_sorted]
+
+        # Scatter the actual tokens into their padded slots
+        x_padded[unpad_indices] = x_sorted
+
+        # Return exactly what you wanted
+        return x_padded, tokens_per_expert_padded, unpad_indices
+
     def _create_sparse_indices(self, tokens_per_expert_padded):
-        """Create row and column indices for sparse blocks."""
+        """Create indices using scatter operations to avoid dynamic shapes."""
         device = tokens_per_expert_padded.device
         
         num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
         num_ffn_blocks = (self.d_ffn + self.block_size - 1) // self.block_size
-        
         blocks_per_expert = num_token_blocks_per_expert * num_ffn_blocks
-        total_blocks = blocks_per_expert.sum().item()
         
-        if total_blocks == 0:
-            return torch.tensor([], dtype=torch.int32, device=device), \
-                   torch.tensor([], dtype=torch.int32, device=device)
+        # Calculate actual total blocks
+        total_blocks = blocks_per_expert.sum()
         
-        expert_ids = torch.repeat_interleave(
-            torch.arange(self.num_experts, device=device),
-            blocks_per_expert
-        )
+        max_token_blocks_per_expert = (self.seq_len * self.num_experts_per_tok) // self.block_size
+        max_blocks = self.num_experts * max_token_blocks_per_expert * num_ffn_blocks
         
-        within_expert_block_idx = torch.cat([
-            torch.arange(n.item(), device=device) 
-            for n in blocks_per_expert if n > 0
-        ])
+        # Create indices for fixed size
+        indices = torch.arange(max_blocks, device=device)
         
+        # Use searchsorted for expert assignment (compile-friendly!)
+        cumsum = blocks_per_expert.cumsum(0)
+        expert_ids = torch.searchsorted(cumsum, indices, right=True)
+        
+        # Clamp expert_ids to valid range to avoid out of bounds
+        expert_ids = torch.clamp(expert_ids, max=self.num_experts - 1)
+        
+        # Compute within-expert indices
+        cumsum_padded = F.pad(cumsum[:-1], (1, 0))
+        within_expert_idx = indices - cumsum_padded[expert_ids]
+        
+        # Compute final indices
         token_block_offset = F.pad(num_token_blocks_per_expert.cumsum(0)[:-1], (1, 0))
-        row_indices = token_block_offset[expert_ids] + (within_expert_block_idx // num_ffn_blocks)
-        weight_col_indices = expert_ids * num_ffn_blocks + (within_expert_block_idx % num_ffn_blocks)
-        output_col_indices = within_expert_block_idx % num_ffn_blocks
+        row_indices = token_block_offset[expert_ids] + (within_expert_idx // num_ffn_blocks)
+        weight_col_indices = expert_ids * num_ffn_blocks + (within_expert_idx % num_ffn_blocks)
+        output_col_indices = within_expert_idx % num_ffn_blocks
+        
+        # Set invalid indices to 0 (they'll be masked in the kernel)
+        valid_mask = indices < total_blocks
+        row_indices = torch.where(valid_mask, row_indices, torch.zeros_like(row_indices))
+        weight_col_indices = torch.where(valid_mask, weight_col_indices, torch.zeros_like(weight_col_indices))
+        output_col_indices = torch.where(valid_mask, output_col_indices, torch.zeros_like(output_col_indices))
         
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
     
@@ -280,18 +311,21 @@ class MoeMLP(nn.Module):
             x_flat, router_weights, selected_experts
         )
         
-        x_padded, router_weights_padded, tokens_per_expert_padded, cumsum_padded, unpad_indices = self._pad_to_blocks(
-            x_sorted, router_weights_sorted, selected_experts_sorted
+        x_padded, tokens_per_expert_padded, unpad_indices = self._pad_to_blocks(
+            x_sorted, selected_experts_sorted
         )
         
         row_indices, weight_col_indices, output_col_indices = self._create_sparse_indices(tokens_per_expert_padded)
         
         if len(row_indices) > 0:
+            # Compute num_ffn_blocks to pass to SDD
+            num_ffn_blocks = (self.d_ffn + self.block_size - 1) // self.block_size
+            
             # total_padded_tokens already computed above as a tensor
             block_sparse = SDD.apply(
                 x_padded, self.w1, 
                 row_indices, weight_col_indices, output_col_indices,
-                self.block_size
+                self.block_size, num_ffn_blocks
             )
             
             block_sparse = F.gelu(block_sparse)
@@ -315,9 +349,15 @@ class MoeMLP(nn.Module):
             # we need to sum their weighted contributions
             num_tokens = batch_size * seq_len
             
-            # inv_indices maps from sorted positions back to original duplicated positions
-            # We need to map to the original token indices (0 to num_tokens-1)
-            original_token_indices = inv_indices % num_tokens
+            # Map each duplicated position (now in x_rep/original duplicate order)
+            # to its original token index (0..num_tokens-1)
+            # Note: after reordering with inv_indices above, `output` is in x_rep order,
+            # so we must not use inv_indices here. Instead, we create a simple arange
+            # over the duplicate positions and integer-divide by k.
+            original_token_indices = (
+                torch.arange(num_tokens * self.num_experts_per_tok, device=output.device)
+                // self.num_experts_per_tok
+            )
             
             # Use scatter_add to efficiently combine all expert outputs at once
             # This avoids both loops and unnecessary memory allocation
@@ -394,30 +434,31 @@ class Block(nn.Module):
     
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
+    n_ctx: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_moe: bool = False
     num_experts: int = 8
     num_experts_per_tok: int = 2
     norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1
-    block_k: int = 64  # Block size for Triton kernels in MoE
+    block_size: int = 16  # Triton kernel tile size for MoE
+    block_k: int = 32  # Triton kernel K dimension for MoE
 
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
-        assert config.block_size is not None
+        assert config.n_ctx is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wpe = nn.Embedding(config.n_ctx, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -488,7 +529,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert t <= self.config.n_ctx, f"Cannot forward sequence of length {t}, context length is only {self.config.n_ctx}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
@@ -533,27 +574,30 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = ce_loss  # Start with cross-entropy loss
             if combined_aux_loss is not None: # add in the aux losses scaled by their weights
                 loss = loss + 0.01 * combined_aux_loss['load_balance_loss'] + 0.001 * combined_aux_loss['router_z_loss']
+                combined_aux_loss['ce_loss'] = ce_loss  # Store CE loss in aux dict for logging
             
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
+            ce_loss = None
 
         return logits, loss, combined_aux_loss  # Return aux losses for logging
 
-    def crop_block_size(self, block_size):
+    def crop_block_size(self, n_ctx):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        assert n_ctx <= self.config.n_ctx
+        self.config.n_ctx = n_ctx
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:n_ctx])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+                block.attn.bias = block.attn.bias[:,:,:n_ctx,:n_ctx]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -571,9 +615,9 @@ class GPT(nn.Module):
             'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
             'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        print("forcing vocab_size=50257, n_ctx=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['n_ctx'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
@@ -642,9 +686,9 @@ class GPT(nn.Module):
         """ estimate model flops utilization (MFU) based on GPU-specific peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
+        N = self.get_active_num_params()
         cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.n_ctx
         flops_per_token = 6*N + 12*L*H*Q*T
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
@@ -692,8 +736,8 @@ class GPT(nn.Module):
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # if the sequence context is growing too long we must crop it at n_ctx
+            idx_cond = idx if idx.size(1) <= self.config.n_ctx else idx[:, -self.config.n_ctx:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature

@@ -10,13 +10,13 @@ log_interval = 10 # don't print too too often
 always_save_checkpoint = False
 
 wandb_log = True # override via command line if you like
-wandb_project = 'moe-test'
+wandb_project = 'moe-test-debug'
 wandb_run_name = 'mini-moe-gpt'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
 batch_size = 64
-block_size = 256 # context of up to 256 previous characters
+n_ctx = 256 # context of up to 256 previous characters
 
 # baby GPT model :)
 n_layer = 6
@@ -41,4 +41,5 @@ use_moe = True
 num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
-block_k = 64
+block_size = 32  # Triton kernel block size
+block_k = 32     # Triton kernel K dimension 

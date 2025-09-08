@@ -11,3 +11,5 @@ input.txt
 env/
 venv/
 wandb/
+*_trace.json
+*.stats

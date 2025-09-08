@@ -17,12 +17,13 @@ use_moe = True
 num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
-block_k = 64
+block_size = 16  # Triton kernel block size
+block_k = 32     # Triton kernel K dimension
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 batch_size = 12
-block_size = 1024
+n_ctx = 1024
 gradient_accumulation_steps = 5 * 8
 
 # this makes total number of tokens be 300B

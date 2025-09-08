@@ -458,7 +458,7 @@ class SDD(torch.autograd.Function):
     """
     
     @staticmethod
-    def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=64):
+    def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=64, num_ffn_blocks=None):
         """
         Args:
             x: Dense input tensor (num_padded_tokens, hidden_size)
@@ -475,9 +475,15 @@ class SDD(torch.autograd.Function):
         num_experts_times_dffn = w1.shape[1]
         num_blocks = len(row_indices)
         
-        # Determine output size based on unique output columns
-        max_output_col = output_col_indices.max().item() if len(output_col_indices) > 0 else 0
-        output_width = (max_output_col + 1) * block_size
+        # Use the provided num_ffn_blocks to determine output width
+        # This avoids data-dependent operations for torch.compile
+        if num_ffn_blocks is None:
+            # Fallback: infer from the maximum output column index
+            # This path won't be used when called from compiled code
+            max_output_col = output_col_indices.max().item() if len(output_col_indices) > 0 else 0
+            output_width = (max_output_col + 1) * block_size
+        else:
+            output_width = num_ffn_blocks * block_size
         
         # Allocate output tensor (compact storage)
         output = torch.zeros((batch_size, output_width), dtype=x.dtype, device=x.device)
@@ -571,7 +577,7 @@ class SDD(torch.autograd.Function):
         )
 
         
-        return grad_x, grad_w1, None, None, None, None
+        return grad_x, grad_w1, None, None, None, None, None
 
 
 class DSD(torch.autograd.Function):
