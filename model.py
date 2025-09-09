@@ -173,7 +173,7 @@ class MoeMLP(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         self.n_embd = config.n_embd
-        self.seq_len = config.n_ctx #sequence length/context length
+        self.seq_len = config.n_ctx
         
         d_ffn = 4 * self.n_embd // self.num_experts_per_tok
         self.block_size = config.block_size  # Triton kernel block size, NOT sequence length!

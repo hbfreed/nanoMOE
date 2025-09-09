@@ -117,7 +117,8 @@ def dsd_kernel(
 
 ):
     pid = tl.program_id(0)
-
+    pid_n = tl.program_id(1)
+    
     # Load indices for the block
     row_idx = tl.load(row_indices_ptr + pid) # pick the tokens we're working on
     weight_col_idx = tl.load(weight_row_indices_ptr + pid) # encodes expert_id and ffn_block
@@ -142,7 +143,7 @@ def dsd_kernel(
 
         # w2 weights for this expert start at expert_id * d_ffn
         w2_row_offsets = expert_id * d_ffn + k + tl.arange(0, BLOCK_K)[:, None]
-        w2_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+        w2_col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
         w2_ptrs = w2_ptr + w2_row_offsets * stride_wk + w2_col_offsets * stride_wn
         
         w2_row_mask = (w2_row_offsets < (expert_id + 1) * d_ffn)
@@ -152,13 +153,32 @@ def dsd_kernel(
         acc += tl.dot(x_tile, w2_tile)
     
     output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
-    output_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    output_col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = output_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
 
     # Add mask to prevent out-of-bounds writes - need to check both dimensions
     # The last block might go beyond the actual number of tokens
     output_mask = (output_col_offsets < hidden_size)
     tl.store(output_ptrs, acc, mask=output_mask)
+
+@triton.jit
+def _dsd_kernel(
+    x_ptr,
+    w2_ptr,
+    output_ptr,
+    row_indices_ptr,
+    weight_row_indices_ptr,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    d_ffn, hidden_dize,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr=8,
+):
+    pass
+
+
 
 @triton.jit
 def sdd_backward_act_kernel(
@@ -183,6 +203,7 @@ def sdd_backward_act_kernel(
        Each thread block processes one sparse gradient block and scatters to dense output."""
 
     pid = tl.program_id(0)  # Which sparse block to process
+    pid_n = tl.program_id(1)
     
     # Load indices for this block
     row_idx = tl.load(row_indices_ptr + pid)           # Which token block
@@ -215,7 +236,7 @@ def sdd_backward_act_kernel(
         # W1^T is (d_ffn * num_experts, hidden_size), select expert's slice
         # Use ffn_block_idx (not output_col_idx) for the position in the expert's weights
         w1t_row_offsets = expert_idx * d_ffn + ffn_block_idx * BLOCK_SIZE + k + tl.arange(0, BLOCK_K)[:, None]
-        w1t_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+        w1t_col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
         w1t_ptrs = w1_t_ptr + w1t_row_offsets * stride_wk + w1t_col_offsets * stride_wn
         
         w1t_mask = (w1t_row_offsets < (expert_idx + 1) * d_ffn) & (w1t_col_offsets < hidden_size)
@@ -227,7 +248,7 @@ def sdd_backward_act_kernel(
     
     # Store to dense output (no atomics needed - each token written once!)
     output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
-    output_col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    output_col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = grad_input_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
     
     output_mask = (output_col_offsets < hidden_size)
@@ -531,7 +552,7 @@ class SDD(torch.autograd.Function):
 
         x_t, w1_t = x.t(), w1.t()
 
-        num_blocks = len(row_indices)
+        num_blocks = (row_indices != 0).sum() #len(row_indices)
         hidden_tiles = math.ceil(hidden_size / block_size)
         d_ffn_tiles = math.ceil(d_ffn / block_size)
         num_ffn_blocks = d_ffn_tiles  # Number of FFN blocks per expert
@@ -541,7 +562,8 @@ class SDD(torch.autograd.Function):
         
         # Allocate gradient tensors
         grad_x = torch.zeros_like(x) 
-        grad_w1 = torch.zeros_like(w1)
+        # Use float32 for weight gradients to support atomic operations
+        grad_w1 = torch.zeros(w1.shape, dtype=torch.float32,device=w1.device)
 
         sdd_backward_act_kernel[x_grid](
             grad_output,         # grad_sparse_ptr
@@ -577,6 +599,9 @@ class SDD(torch.autograd.Function):
         )
 
         
+        # Convert weight gradient back to original dtype
+        grad_w1 = grad_w1.to(w1.dtype)
+        
         return grad_x, grad_w1, None, None, None, None, None
 
 
@@ -606,7 +631,7 @@ class DSD(torch.autograd.Function):
         batch_size = x.shape[0]
         d_ffn = x.shape[1]
         hidden_size = w2.shape[1]
-        num_blocks = len(row_indices)
+        num_blocks = (row_indices != 0).sum() #len(row_indices)
         
         # Allocate dense output
         output = torch.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device)
@@ -663,7 +688,8 @@ class DSD(torch.autograd.Function):
         w2_grid = (num_blocks, hidden_tiles) # 2D grid - each block already knows its FFN position
 
         grad_x = torch.zeros_like(x) 
-        grad_w2 = torch.zeros_like(w2)
+        # Use float32 for weight gradients to support atomic operations
+        grad_w2 = torch.zeros(w2.shape, dtype=torch.float32,device=w2.device)
 
         dsd_backward_act_kernel[x_grid](
             grad_output,         # grad_output_ptr
@@ -697,5 +723,8 @@ class DSD(torch.autograd.Function):
             num_ffn_blocks,                         # For decoding packed indices
             BLOCK_SIZE=block_size,  # Triton tile size
         )
+        
+        # Convert weight gradient back to original dtype
+        grad_w2 = grad_w2.to(w2.dtype)
         
         return grad_x, grad_w2, None, None, None, None

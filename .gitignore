@@ -13,3 +13,5 @@ venv/
 wandb/
 *_trace.json
 *.stats
+*.hatchet
+*.ncu-rep

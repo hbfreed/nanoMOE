@@ -11,6 +11,11 @@ from typing import Dict, List, Tuple
 import argparse
 from tqdm import tqdm
 
+# import os
+# os.environ['TRITON_INTERPRET'] = '1'  # Forces interpreter mode (slow but shows issues)
+# os.environ['TRITON_PRINT_AUTOTUNING'] = '1'  # Shows autotuning choices
+# os.environ['MLIR_ENABLE_DUMP'] = '1'  # Dumps MLIR representation
+
 # Import the models
 from model import MLP, MoeMLP, GPTConfig
 
@@ -568,7 +573,7 @@ def main():
     print(f"CUDA Version: {torch.version.cuda}")
     
     # Run benchmarks
-    results = run_comparison_benchmark(config)
+    # results = run_comparison_benchmark(config)
     
     # Run PyTorch profiling if requested
     if args.profile:
