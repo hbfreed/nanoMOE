@@ -104,8 +104,8 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance
+torch.backends.cudnn.conv.fp32_precision = 'tf32' # Use TF32 for cudnn operations
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
@@ -202,7 +202,7 @@ if n_ctx < model.config.n_ctx:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -214,7 +214,11 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model, fullgraph=True) # requires PyTorch 2.0
+    # Use fullgraph=True for dense models, default for MoE models
+    if 'use_moe' in globals() and use_moe:
+        model = torch.compile(model) # MoE models work better without fullgraph
+    else:
+        model = torch.compile(model, fullgraph=True) # Dense models can use fullgraph
 
 # wrap model into DDP container
 if ddp:

@@ -14,10 +14,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch._dynamo
 from einops import rearrange
-import triton
 
 from moe import SDD, DSD 
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -301,6 +302,7 @@ class MoeMLP(nn.Module):
         
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
     
+    @torch.compiler.disable #sadly have to disable because of triton- TODO: fix this!
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
         x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
@@ -445,8 +447,8 @@ class GPTConfig:
     num_experts: int = 8
     num_experts_per_tok: int = 2
     norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1
-    block_size: int = 16  # Triton kernel tile size for MoE
-    block_k: int = 32  # Triton kernel K dimension for MoE
+    block_size: int = 64  # Triton kernel tile size for MoE
+    block_k: int = 64  # Triton kernel K dimension for MoE
 
 class GPT(nn.Module):
 

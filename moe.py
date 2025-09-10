@@ -113,15 +113,20 @@ def dsd_kernel(
     stride_om, stride_on, # strides for the output
     d_ffn, hidden_size,
     BLOCK_SIZE: tl.constexpr,
-    BLOCK_K: tl.constexpr, # reduction dimension
-
+    BLOCK_K: tl.constexpr, 
+    GROUP_M: tl.constexpr=8
 ):
-    pid = tl.program_id(0)
+    pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+
+    num_pid_m = tl.num_programs(0)
+    num_pid_n = tl.num_programs(1) 
     
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_M)
+
     # Load indices for the block
-    row_idx = tl.load(row_indices_ptr + pid) # pick the tokens we're working on
-    weight_col_idx = tl.load(weight_row_indices_ptr + pid) # encodes expert_id and ffn_block
+    row_idx = tl.load(row_indices_ptr + pid_m) # pick the tokens we're working on
+    weight_col_idx = tl.load(weight_row_indices_ptr + pid_m) # encodes expert_id and ffn_block
     
     # Extract expert_id from weight_col_idx
     # weight_col_idx = expert_id * num_ffn_blocks + ffn_block_idx
@@ -150,7 +155,7 @@ def dsd_kernel(
         w2_mask = w2_row_mask & (w2_col_offsets < hidden_size)
         w2_tile = tl.load(w2_ptrs, mask=w2_mask, other=0.0)
 
-        acc += tl.dot(x_tile, w2_tile)
+        acc += tl.dot(x_tile, w2_tile, allow_tf32=True)
     
     output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
     output_col_offsets = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
@@ -631,7 +636,7 @@ class DSD(torch.autograd.Function):
         batch_size = x.shape[0]
         d_ffn = x.shape[1]
         hidden_size = w2.shape[1]
-        num_blocks = (row_indices != 0).sum() #len(row_indices)
+        num_blocks = len(row_indices)#(row_indices != 0).sum()
         
         # Allocate dense output
         output = torch.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device)
@@ -650,6 +655,7 @@ class DSD(torch.autograd.Function):
             d_ffn, hidden_size,
             BLOCK_SIZE=block_size,  # Triton tile size
             BLOCK_K=min(block_size, d_ffn),
+            GROUP_M=8
         )
         
         ctx.save_for_backward(x, w2, row_indices, weight_row_indices, output_col_indices)

@@ -10,21 +10,31 @@ import torch
 # import torch.profiler as profiler
 # import triton.profiler as proton  # Proton
 
-from model import MoeMLP, GPTConfig
+from model import GPT, GPTConfig
 
 torch.manual_seed(0)
 
 config = GPTConfig()
-config.n_ctx = 512
-config.n_embd = 768
-config.num_experts = 8 
+# Shakespeare char config values
+config.n_ctx = 256
+config.n_layer = 6
+config.n_head = 6
+config.n_embd = 384
+config.dropout = 0.2
+config.use_moe = True
+config.num_experts = 8
 config.num_experts_per_tok = 2
+config.norm_topk_prob = True
+config.block_size = 64
+config.block_k = 64
+config.vocab_size = 50304  # Keep default vocab size
 
-model = MoeMLP(config).cuda().bfloat16()
-x = torch.randn(4, 512, 768, device='cuda', dtype=torch.bfloat16)
+model = GPT(config).cuda().bfloat16()
+# Input tokens for full model (batch_size=4, seq_len=256)
+x = torch.randint(0, config.vocab_size, (4, 256), device='cuda')
 # model = torch.compile(model, fullgraph=True)
 # --- Warmup JIT/caches ---
-for _ in range(3):
+for _ in range(1):
     _ = model(x)[0]
 torch.cuda.synchronize()
 
@@ -40,7 +50,7 @@ def run_proton_loop(repeats: int = 10):
     # proton.activate(0)              # session index 0
     # try:
     for i in range(repeats):
-            # with proton.scope(f"MoeMLP/DSD_region/iter={i}"):
+            # with proton.scope(f"GPT/forward_pass/iter={i}"):
             _ = model(x)[0]
             torch.cuda.synchronize()
     # finally:
@@ -61,7 +71,7 @@ def run_proton_loop(repeats: int = 10):
     # if os.getenv("USE_TORCH_PROF", "0") == "1":
         # run_torch_profiler_once()
     # else:
-repeats = int(os.getenv("REPEATS", "10"))
+repeats = int(os.getenv("REPEATS", "1"))
 run_proton_loop(repeats=repeats)
 
 # finally:
