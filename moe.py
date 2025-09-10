@@ -140,11 +140,12 @@ def dsd_kernel(
         # Load BLOCK_SIZE x BLOCK_K tile from input
         x_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
         x_col_offsets = k + tl.arange(0, BLOCK_K)[None, :]
-        x_ptrs = x_ptr + x_row_offsets * stride_xm + x_col_offsets * stride_xk
         
+        x_ptrs = x_ptr + x_row_offsets * stride_xm + x_col_offsets * stride_xk #flipped these because we transpose the input
         # Need to mask both dimensions - x might have padded tokens
         x_mask = (x_col_offsets < d_ffn)
         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
+        x_tile = gelu_sigmoid(x_tile)
 
         # w2 weights for this expert start at expert_id * d_ffn
         w2_row_offsets = expert_id * d_ffn + k + tl.arange(0, BLOCK_K)[:, None]
@@ -165,25 +166,6 @@ def dsd_kernel(
     # The last block might go beyond the actual number of tokens
     output_mask = (output_col_offsets < hidden_size)
     tl.store(output_ptrs, acc, mask=output_mask)
-
-@triton.jit
-def _dsd_kernel(
-    x_ptr,
-    w2_ptr,
-    output_ptr,
-    row_indices_ptr,
-    weight_row_indices_ptr,
-    stride_xm, stride_xk,
-    stride_wk, stride_wn,
-    stride_om, stride_on,
-    d_ffn, hidden_dize,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr=8,
-):
-    pass
-
-
 
 @triton.jit
 def sdd_backward_act_kernel(
@@ -465,9 +447,17 @@ def gelu(x):
     '''gelu based on https://arxiv.org/pdf/1606.08415#page=2'''
     pass
 
+@triton.jit
 def approx_gelu(x):
     '''approximated gelu based on https://arxiv.org/pdf/1606.08415#page=2'''
     pass
+
+@triton.jit
+def gelu_sigmoid(x):
+    """GELU with casting for bfloat16 compatibility"""
+    x_fp32 = x.to(tl.float32)
+    result = x_fp32 * tl.sigmoid(1.702 * x_fp32)
+    return result.to(x.dtype)  # Cast back to original dtype
 
 @triton.jit
 def tanh(x):

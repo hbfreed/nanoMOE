@@ -271,9 +271,12 @@ class MoeMLP(nn.Module):
         # Calculate actual total blocks
         total_blocks = blocks_per_expert.sum()
         
-        max_token_blocks_per_expert = (self.seq_len * self.num_experts_per_tok) // self.block_size
-        max_token_blocks_per_expert = max(max_token_blocks_per_expert, num_token_blocks_per_expert.max().item())
-        max_blocks = self.num_experts * max_token_blocks_per_expert * num_ffn_blocks
+        max_token_blocks_per_expert_static = (self.seq_len * self.num_experts_per_tok) // self.block_size
+        # BUGFIX: Ensure we allocate enough blocks (compile-safe approach)
+        # Instead of using .item(), compute max_blocks based on actual total_blocks
+        # This ensures we always allocate at least as many blocks as needed
+        max_blocks_static = self.num_experts * max_token_blocks_per_expert_static * num_ffn_blocks
+        max_blocks = torch.maximum(torch.tensor(max_blocks_static, device=device), total_blocks)
         
         # Create indices for fixed size
         indices = torch.arange(max_blocks, device=device)
@@ -331,7 +334,8 @@ class MoeMLP(nn.Module):
                 self.block_size, num_ffn_blocks
             )
             
-            block_sparse = F.gelu(block_sparse)
+            # block_sparse = F.gelu(block_sparse)
+            # block_sparse = block_sparse.t().contiguous() # transpose and contiguous for making dsd perf better
             expert_output = DSD.apply(
                 block_sparse, self.w2,
                 row_indices, weight_col_indices, output_col_indices,
