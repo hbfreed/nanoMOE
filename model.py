@@ -272,6 +272,7 @@ class MoeMLP(nn.Module):
         total_blocks = blocks_per_expert.sum()
         
         max_token_blocks_per_expert = (self.seq_len * self.num_experts_per_tok) // self.block_size
+        max_token_blocks_per_expert = max(max_token_blocks_per_expert, num_token_blocks_per_expert.max().item())
         max_blocks = self.num_experts * max_token_blocks_per_expert * num_ffn_blocks
         
         # Create indices for fixed size
