@@ -47,7 +47,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # profiling
 profile_enabled = True # Set to True to enable cProfile profiling
 profile_iterations = 600  # Number of iterations to profile (set to -1 for all)
-profile_output = 'profile_stats_slow_og.prof'  # Output file for profiling results
+profile_output = 'profile_stats_codex1.prof'  # Output file for profiling results
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'

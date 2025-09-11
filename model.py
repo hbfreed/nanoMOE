@@ -16,7 +16,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch._dynamo
 from einops import rearrange
-
 from moe import SDD, DSD 
 
 class LayerNorm(nn.Module):
@@ -295,8 +294,9 @@ class MoeMLP(nn.Module):
         # Instead of using .item(), compute max_blocks based on actual total_blocks
         # This ensures we always allocate at least as many blocks as needed
         max_blocks_static = self.num_experts * max_token_blocks_per_expert_static * num_ffn_blocks
-        max_blocks = torch.maximum(torch.tensor(max_blocks_static, device=device), total_blocks)
-        
+        # max_blocks = torch.maximum(torch.tensor(max_blocks_static, device=device), total_blocks)
+        max_blocks = total_blocks.clamp_min(max_blocks_static)
+
         # Create indices for fixed size
         indices = torch.arange(max_blocks, device=device)
         
@@ -456,8 +456,7 @@ class Block(nn.Module):
         else:
             mlp_x, aux_loss, f_i = mlp_out, None, None
         x = x + mlp_x
-        return x, aux_loss, f_i
-    
+        return x, aux_loss, f_i    
 @dataclass
 class GPTConfig:
     n_ctx: int = 1024
