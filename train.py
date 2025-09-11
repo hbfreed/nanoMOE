@@ -29,6 +29,11 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+# cProfile imports - optional profiling support
+import cProfile
+import pstats
+from io import StringIO
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -39,6 +44,10 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+# profiling
+profile_enabled = True # Set to True to enable cProfile profiling
+profile_iterations = 600  # Number of iterations to profile (set to -1 for all)
+profile_output = 'profile_stats_slow_og.prof'  # Output file for profiling results
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -216,7 +225,7 @@ if compile:
     unoptimized_model = model
     # Use fullgraph=True for dense models, default for MoE models
     if 'use_moe' in globals() and use_moe:
-        model = torch.compile(model) # MoE models work better without fullgraph
+        model = torch.compile(model)#, mode='max-autotune')
     else:
         model = torch.compile(model, fullgraph=True) # Dense models can use fullgraph
 
@@ -285,7 +294,51 @@ local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 combined_aux_loss = None  # Initialize for first eval at iter 0
+
+# Setup profiling if enabled
+profile_iter_count = 0
+if profile_enabled and master_process:
+    print(f"=== PROFILING ENABLED ===")
+    print(f"Iterations to profile: {profile_iterations if profile_iterations > 0 else 'all'}")
+    print(f"Profile output: {profile_output}")
+    profiler = cProfile.Profile()
+
 while True:
+
+    # Check if we should start/stop profiling
+    if profile_enabled and master_process:
+        # Start profiling at the beginning of the iteration
+        if profile_iter_count == 0:
+            profiler.enable()
+        
+        # Check if we should stop profiling
+        if profile_iterations > 0 and profile_iter_count >= profile_iterations:
+            if profile_iter_count == profile_iterations:
+                profiler.disable()
+                # Save profiling results
+                profiler.dump_stats(profile_output)
+                print(f"=== PROFILING COMPLETE ===")
+                print(f"Profiled {profile_iterations} iterations")
+                print(f"Results saved to {profile_output}")
+                
+                # Print top functions by cumulative time
+                print("\n=== TOP 20 FUNCTIONS BY CUMULATIVE TIME ===")
+                s = StringIO()
+                ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+                ps.print_stats(20)
+                print(s.getvalue())
+                
+                # Print top functions by total time
+                print("\n=== TOP 20 FUNCTIONS BY TOTAL TIME ===")
+                s = StringIO()
+                ps = pstats.Stats(profiler, stream=s).sort_stats('tottime')
+                ps.print_stats(20)
+                print(s.getvalue())
+                
+                # Disable further profiling
+                profile_enabled = False
+        
+        profile_iter_count += 1
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -398,6 +451,21 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# Save profiling results if we were profiling and didn't finish
+if profile_enabled and master_process and profile_iter_count > 0:
+    profiler.disable()
+    profiler.dump_stats(profile_output)
+    print(f"\n=== PROFILING COMPLETE (Training Ended) ===")
+    print(f"Profiled {profile_iter_count} iterations")
+    print(f"Results saved to {profile_output}")
+    
+    # Print summary
+    print("\n=== TOP 20 FUNCTIONS BY CUMULATIVE TIME ===")
+    s = StringIO()
+    ps = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+    ps.print_stats(20)
+    print(s.getvalue())
 
 if ddp:
     destroy_process_group()

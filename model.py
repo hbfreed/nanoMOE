@@ -187,6 +187,24 @@ class MoeMLP(nn.Module):
         
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+
+        self._num_ffn_blocks = (self.d_ffn + self.block_size - 1) // self.block_size
+
+        # maximum token blocks per expert using only compile-stable config values
+        # (upper bound for any forward pass; runtime seq_len ≤ config.n_ctx)
+        max_tok_blocks_per_exp = (self.seq_len * self.num_experts_per_tok + self.block_size - 1) // self.block_size
+
+        # fully static upper bound on total blocks across all experts
+        self._max_blocks_static = self.num_experts * max_tok_blocks_per_exp * self._num_ffn_blocks
+
+        # optional: preallocate a reusable arange buffer to avoid arange each pass
+        self.register_buffer(
+            "_index_buf",
+            torch.arange(self._max_blocks_static, dtype=torch.int32),
+            persistent=False
+        )
+
     
     def _route_tokens(self, x_flat):
         """Route tokens to experts and compute weights."""
@@ -260,6 +278,7 @@ class MoeMLP(nn.Module):
         # Return exactly what you wanted
         return x_padded, tokens_per_expert_padded, unpad_indices
 
+    '''slow, seems to work'''
     def _create_sparse_indices(self, tokens_per_expert_padded):
         """Create indices using scatter operations to avoid dynamic shapes."""
         device = tokens_per_expert_padded.device
@@ -305,7 +324,7 @@ class MoeMLP(nn.Module):
         output_col_indices = torch.where(valid_mask, output_col_indices, torch.zeros_like(output_col_indices))
         
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
-    
+
     @torch.compiler.disable #sadly have to disable because of triton- TODO: fix this!
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
