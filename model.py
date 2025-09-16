@@ -237,39 +237,34 @@ class MoeMLP(nn.Module):
     
     def _pad_to_blocks(self, x_sorted, selected_experts_sorted):
         """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
-        import torch
-        import torch.nn.functional as F
-
         device = x_sorted.device
-        n = x_sorted.shape[0]
-        d = x_sorted.shape[-1]
-        e = self.num_experts
-        b = self.block_size  # Triton token-block size (NOT seq len)
+        num_tokens = x_sorted.shape[0]
+        token_dim = x_sorted.shape[-1]
 
-        # Upper-bound capacity in *blocks* based only on (n,e,b) → compile-safe
-        m = min(n, e)
-        max_blocks = m + (n - m) // b
-        capacity_tokens = max_blocks * b
+        # Use self.num_experts and self.block_size directly
+        min_tokens_or_experts = min(num_tokens, self.num_experts)
+        max_blocks = min_tokens_or_experts + (num_tokens - min_tokens_or_experts) // self.block_size
+        capacity_tokens = max_blocks * self.block_size
 
         # Per-expert counts via scatter_add (compile-safe; avoids bincount)
-        counts = torch.zeros(e, dtype=torch.long, device=device)
+        tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         ones = torch.ones_like(selected_experts_sorted, dtype=torch.long)
-        counts.scatter_add_(0, selected_experts_sorted, ones)
+        tokens_per_expert.scatter_add_(0, selected_experts_sorted, ones)
 
-        # Round each expert up to a multiple of b
-        tokens_per_expert_padded = ((counts + b - 1) // b) * b
+        # Round each expert up to a multiple of block_size
+        tokens_per_expert_padded = ((tokens_per_expert + self.block_size - 1) // self.block_size) * self.block_size
 
         # Exclusive-prefix sums (orig vs padded) for placement
-        off_orig = F.pad(counts.cumsum(0), (1, 0))              # [e+1]
-        off_pad  = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))  # [e+1]
+        offset_original = F.pad(tokens_per_expert.cumsum(0), (1, 0))              # [num_experts+1]
+        offset_padded  = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))        # [num_experts+1]
 
         # Allocate fixed capacity once; the tail is never indexed
-        x_padded = x_sorted.new_zeros((capacity_tokens, d))
+        x_padded = x_sorted.new_zeros((capacity_tokens, token_dim))
 
         # Map each sorted token to its padded position
-        token_idx = torch.arange(n, device=device)
-        idx_within_expert = token_idx - off_orig[selected_experts_sorted]
-        unpad_indices = idx_within_expert + off_pad[selected_experts_sorted]
+        token_idx = torch.arange(num_tokens, device=device)
+        idx_within_expert = token_idx - offset_original[selected_experts_sorted]
+        unpad_indices = idx_within_expert + offset_padded[selected_experts_sorted]
 
         # Scatter the actual tokens into their padded slots
         x_padded[unpad_indices] = x_sorted
