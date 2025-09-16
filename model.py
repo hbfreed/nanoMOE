@@ -197,10 +197,28 @@ class MoeMLP(nn.Module):
         # fully static upper bound on total blocks across all experts
         self._max_blocks_static = self.num_experts * max_tok_blocks_per_exp * self._num_ffn_blocks
 
-        # optional: preallocate a reusable arange buffer to avoid arange each pass
+        # Pre-allocate reusable index buffers to avoid repeated torch.arange calls
+        # Maximum possible tokens in a batch (batch_size * seq_len * num_experts_per_tok)
+        max_total_tokens = self.seq_len * 64 * self.num_experts_per_tok  # 64 is max batch size from config
+
+        # Buffer for block indices (already exists, keep it)
         self.register_buffer(
             "_index_buf",
             torch.arange(self._max_blocks_static, dtype=torch.int32),
+            persistent=False
+        )
+
+        # Buffer for token indices (used in _pad_to_blocks)
+        self.register_buffer(
+            "_token_indices",
+            torch.arange(max_total_tokens, dtype=torch.long),
+            persistent=False
+        )
+
+        # Buffer for inverse indices (used in _sort_by_expert)
+        self.register_buffer(
+            "_inv_indices_buffer",
+            torch.arange(max_total_tokens, dtype=torch.long),
             persistent=False
         )
 
@@ -229,9 +247,8 @@ class MoeMLP(nn.Module):
         router_weights_sorted = router_weights_rep[expert_sort_indices]
         
         inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
-        inv_expert_sort_indices[expert_sort_indices] = torch.arange(
-            expert_sort_indices.numel(), device=x_flat.device
-        )
+        n = expert_sort_indices.numel()
+        inv_expert_sort_indices[expert_sort_indices] = self._inv_indices_buffer[:n].to(x_flat.device)
         
         return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
     
@@ -262,7 +279,7 @@ class MoeMLP(nn.Module):
         x_padded = x_sorted.new_zeros((capacity_tokens, token_dim))
 
         # Map each sorted token to its padded position
-        token_idx = torch.arange(num_tokens, device=device)
+        token_idx = self._token_indices[:num_tokens].to(device)
         idx_within_expert = token_idx - offset_original[selected_experts_sorted]
         unpad_indices = idx_within_expert + offset_padded[selected_experts_sorted]
 
@@ -292,8 +309,8 @@ class MoeMLP(nn.Module):
         # max_blocks = torch.maximum(torch.tensor(max_blocks_static, device=device), total_blocks)
         max_blocks = total_blocks.clamp_min(max_blocks_static)
 
-        # Create indices for fixed size
-        indices = torch.arange(max_blocks, device=device)
+        # Create indices for fixed size (reuse pre-allocated buffer)
+        indices = self._index_buf[:max_blocks].to(device)
         
         # Use searchsorted for expert assignment (compile-friendly!)
         cumsum = blocks_per_expert.cumsum(0)
