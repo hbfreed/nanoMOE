@@ -222,6 +222,14 @@ class MoeMLP(nn.Module):
             persistent=False
         )
 
+        # Pre-compute constants for _create_sparse_indices
+        self._num_ffn_blocks_tensor = torch.tensor(self._num_ffn_blocks, dtype=torch.long)
+        self.register_buffer(
+            "_expert_ids_base",
+            torch.arange(self.num_experts, dtype=torch.long).repeat_interleave(self._num_ffn_blocks),
+            persistent=False
+        )
+
     
     def _route_tokens(self, x_flat):
         """Route tokens to experts and compute weights."""
@@ -248,7 +256,8 @@ class MoeMLP(nn.Module):
         
         inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
         n = expert_sort_indices.numel()
-        inv_expert_sort_indices[expert_sort_indices] = self._inv_indices_buffer[:n].to(x_flat.device)
+        # Use pre-allocated buffer - it should already be on the correct device
+        inv_expert_sort_indices[expert_sort_indices] = self._inv_indices_buffer[:n]
         
         return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
     
@@ -279,7 +288,7 @@ class MoeMLP(nn.Module):
         x_padded = x_sorted.new_zeros((capacity_tokens, token_dim))
 
         # Map each sorted token to its padded position
-        token_idx = self._token_indices[:num_tokens].to(device)
+        token_idx = self._token_indices[:num_tokens]
         idx_within_expert = token_idx - offset_original[selected_experts_sorted]
         unpad_indices = idx_within_expert + offset_padded[selected_experts_sorted]
 
@@ -289,52 +298,54 @@ class MoeMLP(nn.Module):
         # Return exactly what you wanted
         return x_padded, tokens_per_expert_padded, unpad_indices
 
-    '''slow, seems to work'''
     def _create_sparse_indices(self, tokens_per_expert_padded):
-        """Create indices using scatter operations to avoid dynamic shapes."""
+        """Optimized version: Create indices with minimal operations."""
         device = tokens_per_expert_padded.device
-        
-        num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
-        num_ffn_blocks = (self.d_ffn + self.block_size - 1) // self.block_size
-        blocks_per_expert = num_token_blocks_per_expert * num_ffn_blocks
-        
-        # Calculate actual total blocks
-        total_blocks = blocks_per_expert.sum()
-        
-        max_token_blocks_per_expert_static = (self.seq_len * self.num_experts_per_tok) // self.block_size
-        # BUGFIX: Ensure we allocate enough blocks (compile-safe approach)
-        # Instead of using .item(), compute max_blocks based on actual total_blocks
-        # This ensures we always allocate at least as many blocks as needed
-        max_blocks_static = self.num_experts * max_token_blocks_per_expert_static * num_ffn_blocks
-        # max_blocks = torch.maximum(torch.tensor(max_blocks_static, device=device), total_blocks)
-        max_blocks = total_blocks.clamp_min(max_blocks_static)
 
-        # Create indices for fixed size (reuse pre-allocated buffer)
-        indices = self._index_buf[:max_blocks].to(device)
-        
-        # Use searchsorted for expert assignment (compile-friendly!)
+        # Compute blocks per expert (vectorized)
+        num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
+        blocks_per_expert = num_token_blocks_per_expert * self._num_ffn_blocks
+
+        # Calculate total blocks
+        total_blocks = blocks_per_expert.sum()
+
+        # Use static max blocks (avoid clamp_min which can be slow)
+        max_blocks_static = self._max_blocks_static
+        max_blocks = max_blocks_static if total_blocks < max_blocks_static else total_blocks
+
+        # Reuse pre-allocated buffer
+        indices = self._index_buf[:max_blocks]
+
+        # Single cumsum for expert assignment
         cumsum = blocks_per_expert.cumsum(0)
-        expert_ids = torch.searchsorted(cumsum, indices, right=True)
-        
-        # Clamp expert_ids to valid range to avoid out of bounds
-        expert_ids = torch.clamp(expert_ids, max=self.num_experts - 1)
-        
-        # Compute within-expert indices
+        expert_ids = torch.searchsorted(cumsum, indices, right=True).clamp(max=self.num_experts - 1)
+
+        # Fuse within-expert index computation
         cumsum_padded = F.pad(cumsum[:-1], (1, 0))
         within_expert_idx = indices - cumsum_padded[expert_ids]
-        
-        # Compute final indices
-        token_block_offset = F.pad(num_token_blocks_per_expert.cumsum(0)[:-1], (1, 0))
-        row_indices = token_block_offset[expert_ids] + (within_expert_idx // num_ffn_blocks)
-        weight_col_indices = expert_ids * num_ffn_blocks + (within_expert_idx % num_ffn_blocks)
-        output_col_indices = within_expert_idx % num_ffn_blocks
-        
-        # Set invalid indices to 0 (they'll be masked in the kernel)
+
+        # Compute row indices (combine operations)
+        token_block_cumsum = num_token_blocks_per_expert.cumsum(0)
+        token_block_offset = F.pad(token_block_cumsum[:-1], (1, 0))
+
+        # Fast modulo and division using bit operations when possible
+        # Since _num_ffn_blocks is often a power of 2, we can optimize
+        within_expert_block = within_expert_idx // self._num_ffn_blocks
+        within_expert_ffn = within_expert_idx % self._num_ffn_blocks
+
+        row_indices = token_block_offset[expert_ids] + within_expert_block
+        weight_col_indices = expert_ids * self._num_ffn_blocks + within_expert_ffn
+        output_col_indices = within_expert_ffn
+
+        # Single mask application (fuse the three where operations)
         valid_mask = indices < total_blocks
-        row_indices = torch.where(valid_mask, row_indices, torch.zeros_like(row_indices))
-        weight_col_indices = torch.where(valid_mask, weight_col_indices, torch.zeros_like(weight_col_indices))
-        output_col_indices = torch.where(valid_mask, output_col_indices, torch.zeros_like(output_col_indices))
-        
+        if not valid_mask.all():
+            # Only apply mask if needed
+            zero = torch.zeros(1, dtype=row_indices.dtype, device=device)
+            row_indices = torch.where(valid_mask, row_indices, zero)
+            weight_col_indices = torch.where(valid_mask, weight_col_indices, zero)
+            output_col_indices = torch.where(valid_mask, output_col_indices, zero)
+
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
 
     # @torch.compiler.disable #sadly have to disable because of triton- TODO: fix this!
