@@ -320,7 +320,7 @@ class MoeMLP(nn.Module):
         
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
 
-    @torch.compiler.disable #sadly have to disable because of triton- TODO: fix this!
+    # @torch.compiler.disable #sadly have to disable because of triton- TODO: fix this!
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
         x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')

@@ -474,6 +474,7 @@ class SDD(torch.autograd.Function):
     """
     
     @staticmethod
+    @torch.compiler.disable
     def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=64, num_ffn_blocks=None):
         """
         Args:
@@ -529,6 +530,7 @@ class SDD(torch.autograd.Function):
         return output
     
     @staticmethod
+    @torch.compiler.disable
     def backward(ctx, grad_output):
         """
         Computes gradients for x and w1 given grad_output
@@ -558,7 +560,7 @@ class SDD(torch.autograd.Function):
         # Allocate gradient tensors
         grad_x = torch.zeros_like(x) 
         # Use float32 for weight gradients to support atomic operations
-        grad_w1 = torch.zeros(w1.shape, dtype=torch.float32,device=w1.device)
+        grad_w1 = torch.zeros_like(w1, dtype=torch.float32)
 
         sdd_backward_act_kernel[x_grid](
             grad_output,         # grad_sparse_ptr
@@ -610,6 +612,7 @@ class DSD(torch.autograd.Function):
     """
     
     @staticmethod
+    @torch.compiler.disable
     def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=64):
         """
         Args:
@@ -656,6 +659,7 @@ class DSD(torch.autograd.Function):
         return output
     
     @staticmethod
+    @torch.compiler.disable
     def backward(ctx, grad_output):
         """
         Computes gradients for x and w2 given grad_output
@@ -685,7 +689,7 @@ class DSD(torch.autograd.Function):
 
         grad_x = torch.zeros_like(x) 
         # Use float32 for weight gradients to support atomic operations
-        grad_w2 = torch.zeros(w2.shape, dtype=torch.float32,device=w2.device)
+        grad_w2 = torch.zeros_like(w2, dtype=torch.float32)
 
         dsd_backward_act_kernel[x_grid](
             grad_output,         # grad_output_ptr

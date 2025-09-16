@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model_optimized import GPTConfig, GPT
+from model import GPTConfig, GPT
 
 # cProfile imports - optional profiling support
 import cProfile
