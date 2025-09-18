@@ -298,23 +298,19 @@ class MoeMLP(nn.Module):
         # Return exactly what you wanted
         return x_padded, tokens_per_expert_padded, unpad_indices
 
+    @torch.compiler.disable
     def _create_sparse_indices(self, tokens_per_expert_padded):
-        """Optimized version: Create indices with minimal operations."""
         device = tokens_per_expert_padded.device
 
         # Compute blocks per expert (vectorized)
         num_token_blocks_per_expert = tokens_per_expert_padded // self.block_size
         blocks_per_expert = num_token_blocks_per_expert * self._num_ffn_blocks
 
-        # Calculate total blocks
-        total_blocks = blocks_per_expert.sum()
+        # Convert to Python int ONCE to avoid dynamic shapes in torch.compile
+        # This single .item() call prevents thousands of shape guard checks
+        total_blocks = int(blocks_per_expert.sum())
 
-        # Use static max blocks (avoid clamp_min which can be slow)
-        max_blocks_static = self._max_blocks_static
-        max_blocks = max_blocks_static if total_blocks < max_blocks_static else total_blocks
-
-        # Reuse pre-allocated buffer
-        indices = self._index_buf[:max_blocks]
+        indices = torch.arange(total_blocks, device=device, dtype=torch.long)
 
         # Single cumsum for expert assignment
         cumsum = blocks_per_expert.cumsum(0)
@@ -336,15 +332,6 @@ class MoeMLP(nn.Module):
         row_indices = token_block_offset[expert_ids] + within_expert_block
         weight_col_indices = expert_ids * self._num_ffn_blocks + within_expert_ffn
         output_col_indices = within_expert_ffn
-
-        # Single mask application (fuse the three where operations)
-        valid_mask = indices < total_blocks
-        if not valid_mask.all():
-            # Only apply mask if needed
-            zero = torch.zeros(1, dtype=row_indices.dtype, device=device)
-            row_indices = torch.where(valid_mask, row_indices, zero)
-            weight_col_indices = torch.where(valid_mask, weight_col_indices, zero)
-            output_col_indices = torch.where(valid_mask, output_col_indices, zero)
 
         return row_indices.int(), weight_col_indices.int(), output_col_indices.int()
 

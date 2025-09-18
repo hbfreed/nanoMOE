@@ -6,6 +6,7 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
+from tokenizers import Tokenizer
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -55,9 +56,23 @@ if compile:
 
 # look for the meta pickle in case it is available in the dataset folder
 load_meta = False
+tokenizer_loaded = False
 if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
+    dataset_name = checkpoint['config']['dataset']
+    meta_path = os.path.join('data', dataset_name, 'meta.pkl')
+    tokenizer_path = os.path.join('data', dataset_name, f'{dataset_name}_tokenizer_8k.json')
+
+    # First try to load the tokenizer.json if it exists
+    if os.path.exists(tokenizer_path):
+        print(f"Loading tokenizer from {tokenizer_path}...")
+        tokenizer = Tokenizer.from_file(tokenizer_path)
+        encode = lambda s: tokenizer.encode(s).ids
+        decode = lambda l: tokenizer.decode(l)
+        tokenizer_loaded = True
+    elif os.path.exists(meta_path):
+        # Fall back to meta.pkl for character-level models
+        load_meta = True
+
 if load_meta:
     print(f"Loading meta from {meta_path}...")
     with open(meta_path, 'rb') as f:
@@ -66,9 +81,9 @@ if load_meta:
     stoi, itos = meta['stoi'], meta['itos']
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
-else:
+elif not tokenizer_loaded:
     # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
+    print("No tokenizer or meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)

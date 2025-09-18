@@ -496,9 +496,13 @@ class SDD(torch.autograd.Function):
         # This avoids data-dependent operations for torch.compile
         if num_ffn_blocks is None:
             # Fallback: infer from the maximum output column index
-            # This path won't be used when called from compiled code
-            max_output_col = output_col_indices.max().item() if len(output_col_indices) > 0 else 0
-            output_width = (max_output_col + 1) * block_size
+            # This path should rarely be used when called from compiled code
+            if len(output_col_indices) > 0:
+                # We need to convert to int for tensor allocation, but do it efficiently
+                max_output_col_int = int(output_col_indices.max())
+                output_width = (max_output_col_int + 1) * block_size
+            else:
+                output_width = block_size
         else:
             output_width = num_ffn_blocks * block_size
         

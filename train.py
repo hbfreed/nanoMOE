@@ -45,8 +45,8 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # profiling
-profile_enabled = False # Set to True to enable cProfile profiling
-profile_iterations = 600  # Number of iterations to profile (set to -1 for all)
+profile_enabled = True # Set to True to enable cProfile profiling
+profile_iterations = -1  # Number of iterations to profile (set to -1 for all)
 profile_output = 'profile_stats.prof'  # Output file for profiling results
 # wandb logging
 wandb_log = False # disabled by default
@@ -63,6 +63,14 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# MoE parameters
+use_moe = False # whether to use Mixture of Experts
+num_experts = 8 # number of experts in MoE layer
+num_experts_per_tok = 2 # number of experts to route to per token
+norm_topk_prob = True # normalize the top-k probabilities to sum to 1
+block_size = 64 # Triton kernel tile size for MoE
+block_k = 64 # Triton kernel K dimension for MoE
+router_aux_loss_coef = 0.01 # auxiliary loss coefficient for load balancing
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -122,6 +130,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+print(f"using data_dir:{data_dir}")
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -162,6 +171,7 @@ if 'use_moe' in globals():
         model_args['num_experts'] = num_experts
         model_args['num_experts_per_tok'] = num_experts_per_tok
         model_args['norm_topk_prob'] = norm_topk_prob
+        model_args['block_size'] = block_size
         model_args['block_k'] = block_k
         print(f"MoE enabled with {num_experts} experts, {num_experts_per_tok} experts per token")
 if init_from == 'scratch':
@@ -225,7 +235,8 @@ if compile:
     unoptimized_model = model
     # Use fullgraph=True for dense models, default for MoE models
     if 'use_moe' in globals() and use_moe:
-        model = torch.compile(model)#, mode='max-autotune')
+        torch._dynamo.config.capture_scalar_outputs = True
+        model = torch.compile(model)#, mode='reduce-overhead')
     else:
         model = torch.compile(model, fullgraph=True) # Dense models can use fullgraph
 
