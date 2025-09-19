@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -17,6 +18,9 @@ from torch.nn import functional as F
 import torch._dynamo
 from einops import rearrange
 from moe import SDD, DSD 
+import stk.ops
+import stk.random
+import stk.matrix 
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -165,6 +169,285 @@ class MoeMLPForLoop(nn.Module):
         
         return output.view(batch_size, seq_len, hidden_dim), aux_loss, f_i
 
+class MoeMegaBlocks(nn.Module):
+
+class MoeMLPSTK(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
+        self.n_embd = config.n_embd
+        self.seq_len = config.n_ctx
+        
+        d_ffn = 4 * self.n_embd // self.num_experts_per_tok
+        self.block_size = config.block_size  # Triton kernel block size, NOT sequence length!
+        self.d_ffn = ((d_ffn + self.block_size - 1) // self.block_size) * self.block_size
+        self.block_k = config.block_k
+        
+        self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
+        self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
+        self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
+        
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+    
+    def _route_tokens(self, x_flat):
+        """Route tokens to experts and compute weights."""
+        router_logits = self.router(x_flat)
+        router_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        router_weights, selected_experts = torch.topk(router_weights, self.num_experts_per_tok, dim=-1)
+        
+        if self.norm_topk_prob:
+            router_weights /= router_weights.sum(dim=-1, keepdim=True)
+        
+        router_weights = router_weights.to(x_flat.dtype)
+        return router_weights, selected_experts, router_logits
+    
+    def _sort_by_expert(self, x_flat, router_weights, selected_experts):
+        """Replicate tokens for each expert and sort by expert assignment."""
+        x_rep = x_flat.repeat_interleave(self.num_experts_per_tok, dim=0)
+        selected_experts_rep = selected_experts.reshape(-1)
+        router_weights_rep = router_weights.reshape(-1, 1)
+
+        expert_sort_indices = torch.argsort(selected_experts_rep, stable=True).long()
+        x_sorted = x_rep[expert_sort_indices]
+        selected_experts_sorted = selected_experts_rep[expert_sort_indices]
+        router_weights_sorted = router_weights_rep[expert_sort_indices]
+
+        # Compute the inverse permutation correctly
+        inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
+        inv_expert_sort_indices[expert_sort_indices] = torch.arange(
+            len(expert_sort_indices), device=expert_sort_indices.device
+        )
+
+        return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
+
+    def _pad_to_blocks(self, x_sorted, selected_experts_sorted):
+        """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
+        device = x_sorted.device
+        num_tokens = x_sorted.shape[0]
+        token_dim = x_sorted.shape[-1]
+
+        # Use self.num_experts and self.block_size directly
+        min_tokens_or_experts = min(num_tokens, self.num_experts)
+        max_blocks = min_tokens_or_experts + (num_tokens - min_tokens_or_experts) // self.block_size
+
+        # Bucketize capacity to reduce torch.compile recompilations
+        # Round to nearest 2048 tokens (16 blocks of 128 each)
+        raw_capacity = max_blocks * self.block_size
+        bucket_size = 2048
+        capacity_tokens = ((raw_capacity + bucket_size - 1) // bucket_size) * bucket_size
+
+        # Per-expert counts via scatter_add (compile-safe; avoids bincount)
+        tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        ones = torch.ones_like(selected_experts_sorted, dtype=torch.long)
+        tokens_per_expert.scatter_add_(0, selected_experts_sorted, ones)
+
+        # Round each expert up to a multiple of block_size
+        tokens_per_expert_padded = ((tokens_per_expert + self.block_size - 1) // self.block_size) * self.block_size
+
+        # Exclusive-prefix sums (orig vs padded) for placement
+        offset_original = F.pad(tokens_per_expert.cumsum(0), (1, 0))
+        offset_padded  = F.pad(tokens_per_expert_padded.cumsum(0), (1, 0))
+
+        # Allocate fixed capacity once; the tail is never indexed
+        x_padded = x_sorted.new_zeros((capacity_tokens, token_dim))
+
+        
+        # Map each sorted token to its padded position
+        token_idx = torch.arange(num_tokens, device=x_sorted.device)
+        idx_within_expert = token_idx - offset_original[selected_experts_sorted]
+        unpad_indices = idx_within_expert + offset_padded[selected_experts_sorted]
+
+        # Scatter the actual tokens into their padded slots
+        x_padded[unpad_indices] = x_sorted
+
+        # Return exactly what you wanted
+        return x_padded, tokens_per_expert_padded, unpad_indices
+
+    def _make_topology(self, x_padded: torch.Tensor,
+                    tokens_per_expert_padded: torch.Tensor,
+                    ) -> stk.matrix.Matrix:
+        """Construct a block-compressed sparse topology for stk.ops.sdd."""
+        if x_padded.dim() != 2:
+            raise ValueError("x_padded must be 2D [tokens, hidden].")
+
+        device = x_padded.device
+        dtype = x_padded.dtype
+
+        if self.d_ffn % self.block_size != 0:
+            raise ValueError(f"Model width d_ffn={self.d_ffn} must be divisible by block_size={self.block_size}.")
+
+        # Skip validation to avoid .item() calls in hot path
+        # if int(tokens_per_expert_padded.sum().item()) != x_padded.shape[0]:
+        #     raise ValueError("x_padded row count must equal sum(tokens_per_expert_padded).")
+
+        if x_padded.shape[0] % self.block_size != 0:
+            raise ValueError("Padded rows must be a multiple of block_size for BCSR layout.")
+
+        if torch.any(tokens_per_expert_padded % self.block_size):
+            raise ValueError("Each expert's padded token count must be divisible by block_size.")
+
+        tokens_per_expert_blocks = tokens_per_expert_padded // self.block_size
+        num_row_blocks = tokens_per_expert_blocks.sum()
+        col_blocks_per_expert = self.d_ffn // self.block_size
+        total_col_blocks = col_blocks_per_expert * self.num_experts
+
+        # Use int32 - should be sufficient for most use cases
+        row_index_dtype = torch.int32
+        column_index_dtype = torch.int32
+
+        # Check if we have blocks using tensor comparison
+        if num_row_blocks.eq(0):
+            row_indices = torch.empty(0, dtype=row_index_dtype, device=device)
+            column_indices = torch.empty(0, dtype=column_index_dtype, device=device)
+            offsets = torch.zeros(1, dtype=torch.int32, device=device)
+            data = torch.zeros((0, self.block_size, self.block_size), dtype=dtype, device=device)
+            matrix_rows = 0
+        else:
+            row_indices = torch.arange(
+                num_row_blocks, device=device, dtype=row_index_dtype
+            ).repeat_interleave(col_blocks_per_expert)
+
+            expert_ids_per_row = torch.repeat_interleave(
+                torch.arange(self.num_experts, device=device),
+                tokens_per_expert_blocks
+            )
+
+            base_offsets = expert_ids_per_row.to(column_index_dtype) * col_blocks_per_expert
+            base_offsets = base_offsets.repeat_interleave(col_blocks_per_expert)
+
+            col_range = torch.arange(
+                col_blocks_per_expert, device=device, dtype=column_index_dtype
+            ).repeat(num_row_blocks)
+
+            column_indices = base_offsets + col_range
+
+            offsets = torch.arange(
+                num_row_blocks + 1, device=device, dtype=torch.int32
+            ) * col_blocks_per_expert
+
+            num_blocks = num_row_blocks * col_blocks_per_expert
+            # Allocate minimal data tensor - STK needs this
+            data = torch.zeros((num_blocks, self.block_size, self.block_size), device=device, dtype=dtype)
+            matrix_rows = tokens_per_expert_padded.sum()
+
+        topo = stk.matrix.Matrix(
+            size=(matrix_rows, self.d_ffn * self.num_experts),
+            data=data,
+            row_indices=row_indices,
+            column_indices=column_indices,
+            offsets=offsets,
+        )
+        return topo
+
+    @torch.compiler.disable
+    def _run_stk_ops(self, x_padded, tokens_per_expert_padded):
+        """Run STK operations without compilation to avoid recompilation overhead."""
+        topo = self._make_topology(x_padded, tokens_per_expert_padded)
+
+        block_sparse = stk.ops.sdd(x_padded, self.w1, topo)
+        activated_blocks = F.gelu(block_sparse.data)
+        block_sparse = stk.matrix.Matrix(
+            size=block_sparse.size(),
+            data=activated_blocks,
+            row_indices=block_sparse.row_indices,
+            column_indices=block_sparse.column_indices,
+            offsets=block_sparse.offsets,
+            column_indices_t=block_sparse.column_indices_t,
+            offsets_t=block_sparse.offsets_t,
+            block_offsets_t=block_sparse.block_offsets_t,
+        )
+        expert_output = stk.ops.dsd(block_sparse, self.w2)
+        return expert_output
+
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+        x_flat = rearrange(x, 'batch seq hidden -> (batch seq) hidden')
+        
+        router_weights, selected_experts, router_logits = self._route_tokens(x_flat)
+        
+        x_sorted, selected_experts_sorted, router_weights_sorted, sort_indices = self._sort_by_expert(
+            x_flat, router_weights, selected_experts
+        )
+        
+        x_padded, tokens_per_expert_padded, unpad_indices = self._pad_to_blocks(x_sorted, selected_experts_sorted)
+        total_padded_tokens = tokens_per_expert_padded.sum()
+        x_padded = x_padded[:total_padded_tokens]
+
+        expert_output = self._run_stk_ops(x_padded, tokens_per_expert_padded)
+
+        if router_weights_sorted.shape[0] != unpad_indices.shape[0]:
+            raise RuntimeError(
+                "Router weights and unpad indices disagree: "
+                f"{router_weights_sorted.shape[0]} vs {unpad_indices.shape[0]}"
+            )
+        if unpad_indices.numel() and unpad_indices.max() >= expert_output.shape[0]:
+            raise RuntimeError(
+                "Unpad index out of range: "
+                f"max={unpad_indices.max()} rows={expert_output.shape[0]}"
+            )
+
+        output_unpadded = torch.index_select(expert_output, 0, unpad_indices)
+        output_weighted = output_unpadded * router_weights_sorted
+
+        # Unpermute back to original token order using the original sort indices
+        if sort_indices.numel() != output_weighted.shape[0]:
+            raise RuntimeError(
+                "Sort indices and output disagree: "
+                f"{sort_indices.shape[0]} vs {output_weighted.shape[0]}"
+            )
+        # Properly apply inverse permutation
+        output = output_weighted[sort_indices]
+
+        num_tokens = batch_size * seq_len
+        
+        original_token_indices = (
+            torch.arange(num_tokens * self.num_experts_per_tok, device=output.device)
+            // self.num_experts_per_tok
+        )
+        
+        combined_output = torch.zeros((num_tokens, self.n_embd), 
+                                        dtype=output.dtype, device=output.device)
+        combined_output.scatter_add_(
+            0,
+            original_token_indices.unsqueeze(-1).expand(-1, self.n_embd),
+            output
+        )
+        output = combined_output
+        
+        # Reshape back to original batch dimensions
+        output = rearrange(output, '(batch seq) hidden -> batch seq hidden', 
+                            batch=batch_size, seq=seq_len)
+
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean() # router z-loss keeps router logits small
+        
+        # Load balance loss: encourages uniform distribution across experts
+        p_i = F.softmax(router_logits, dim=-1)  # Shape: (batch*seq, num_experts)
+        p_i = p_i.mean(dim=0)  # Average probability per expert: (num_experts,)
+        
+        if len(selected_experts) > 0:
+            experts_flat = selected_experts.flatten()
+
+            f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
+            ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
+            f_i.scatter_add_(0, experts_flat, ones)
+            load_balance_loss = self.num_experts * (f_i @ p_i)
+        else:
+            # No tokens routed - no imbalance possible
+            load_balance_loss = torch.tensor(0.0, device=x.device)
+            f_i = torch.zeros(self.num_experts, device=x.device)
+        
+        # Package auxiliary losses for the training script
+        aux_loss = {
+            'router_z_loss': router_z_loss,
+            'load_balance_loss': load_balance_loss,
+        }
+        
+        return output, aux_loss, f_i 
 class MoeMLP(nn.Module):
     
     def __init__(self, config):
@@ -249,17 +532,12 @@ class MoeMLP(nn.Module):
         selected_experts_rep = selected_experts.reshape(-1)
         router_weights_rep = router_weights.reshape(-1, 1)
         
-        expert_sort_indices = torch.argsort(selected_experts_rep, stable=True)
+        expert_sort_indices = torch.argsort(selected_experts_rep, stable=True).long()
         x_sorted = x_rep[expert_sort_indices]
         selected_experts_sorted = selected_experts_rep[expert_sort_indices]
         router_weights_sorted = router_weights_rep[expert_sort_indices]
-        
-        inv_expert_sort_indices = torch.empty_like(expert_sort_indices)
-        n = expert_sort_indices.numel()
-        # Use pre-allocated buffer - it should already be on the correct device
-        inv_expert_sort_indices[expert_sort_indices] = self._inv_indices_buffer[:n]
-        
-        return x_sorted, selected_experts_sorted, router_weights_sorted, inv_expert_sort_indices
+
+        return x_sorted, selected_experts_sorted, router_weights_sorted, expert_sort_indices
     
     def _pad_to_blocks(self, x_sorted, selected_experts_sorted):
         """Pad each expert's tokens to multiples of block_size and track unpadding indices."""
@@ -270,7 +548,12 @@ class MoeMLP(nn.Module):
         # Use self.num_experts and self.block_size directly
         min_tokens_or_experts = min(num_tokens, self.num_experts)
         max_blocks = min_tokens_or_experts + (num_tokens - min_tokens_or_experts) // self.block_size
-        capacity_tokens = max_blocks * self.block_size
+
+        # Bucketize capacity to reduce torch.compile recompilations
+        # Round to nearest 2048 tokens (16 blocks of 128 each)
+        raw_capacity = max_blocks * self.block_size
+        bucket_size = 2048
+        capacity_tokens = ((raw_capacity + bucket_size - 1) // bucket_size) * bucket_size
 
         # Per-expert counts via scatter_add (compile-safe; avoids bincount)
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.long, device=device)
@@ -480,7 +763,7 @@ class GPTConfig:
     num_experts: int = 8
     num_experts_per_tok: int = 2
     norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1
-    block_size: int = 64  # Triton kernel tile size for MoE
+    block_size: int = 128  # Triton kernel tile size for MoE
     block_k: int = 64  # Triton kernel K dimension for MoE
 
 class GPT(nn.Module):

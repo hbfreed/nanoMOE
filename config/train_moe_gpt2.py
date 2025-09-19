@@ -17,7 +17,7 @@ use_moe = True
 num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
-block_size = 64  # Triton kernel block size
+block_size = 128  # Triton kernel block size
 block_k = 64     # Triton kernel K dimension
 
 # these make the total batch size be ~0.5M

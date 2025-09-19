@@ -475,7 +475,7 @@ class SDD(torch.autograd.Function):
     
     @staticmethod
     @torch.compiler.disable
-    def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=64, num_ffn_blocks=None):
+    def forward(ctx, x, w1, row_indices, weight_col_indices, output_col_indices, block_size=128, num_ffn_blocks=None):
         """
         Args:
             x: Dense input tensor (num_padded_tokens, hidden_size)
@@ -617,7 +617,7 @@ class DSD(torch.autograd.Function):
     
     @staticmethod
     @torch.compiler.disable
-    def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=64):
+    def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=128):
         """
         Args:
             x: Sparse input tensor in compact form (num_padded_tokens, d_ffn_compact)

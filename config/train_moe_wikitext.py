@@ -15,7 +15,7 @@ use_moe = True
 num_experts = 64
 num_experts_per_tok = 8
 norm_topk_prob = True
-block_size = 64
+block_size = 128
 block_k = 64
 
 batch_size = 64
