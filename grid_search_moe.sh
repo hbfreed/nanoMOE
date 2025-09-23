@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES=$gpu_idx python3 train.py \
     --gradient_accumulation_steps=1 \
     --max_iters=5000 \
     --lr_decay_iters=5000 \
-    --learning_rate=6e-4 \
+    --learning_rate=1e-3 \
     --min_lr=6e-5 \
     --eval_interval=250 \
     --eval_iters=200 \
@@ -87,7 +87,7 @@ for total in "${total_experts[@]}"; do
             --gradient_accumulation_steps=1 \
             --max_iters=5000 \
             --lr_decay_iters=5000 \
-            --learning_rate=6e-4 \
+            --learning_rate=1e-3 \
             --min_lr=6e-5 \
             --eval_interval=250 \
             --eval_iters=200 \
@@ -95,8 +95,8 @@ for total in "${total_experts[@]}"; do
             --num_experts=$total \
             --num_experts_per_tok=$active \
             --norm_topk_prob=True \
-            --block_size=64 \
-            --block_k=64 \
+            --block_size=128 \
+            --block_k=128 \
             --wandb_log=True \
             --wandb_project="moe-wikitext-gridsearch" \
             --wandb_run_name="$wandb_name" \
@@ -130,6 +130,80 @@ for total in "${total_experts[@]}"; do
     done
 done
 
+
+# TINY EXPERIMENTS - 6 layers, 4 heads, 128 n_embd
+echo ""
+echo "=== LAUNCHING TINY EXPERIMENTS ==="
+echo "Config: 4 layers, 4 heads, 256 n_embd"
+echo ""
+
+# Tiny MoE configurations
+tiny_total_experts=(8 16 32 64)
+tiny_active_experts=(2 4 8)
+
+for total in "${tiny_total_experts[@]}"; do
+    for active in "${tiny_active_experts[@]}"; do
+        # Skip invalid combinations (active > total)
+        if [ $active -gt $total ]; then
+            echo "Skipping invalid combo: total=$total, active=$active (active > total)"
+            continue
+        fi
+
+        # Skip the 8/8 combination as requested
+        if [ $total -eq 8 ] && [ $active -eq 8 ]; then
+            echo "Skipping combo: total=8, active=8 (as requested)"
+            continue
+        fi
+
+        wandb_name="4L-4H-tiny-moe-experts${total}-active${active}"
+        echo "Launching tiny MoE: total=$total, active=$active on GPU $gpu_idx (wandb: $wandb_name)"
+
+        CUDA_VISIBLE_DEVICES=$gpu_idx python3 train.py \
+            --dataset=wikitext \
+            --n_layer=4 \
+            --n_head=4 \
+            --n_embd=256 \
+            --dropout=0.2 \
+            --bias=False \
+            --batch_size=64 \
+            --n_ctx=256\
+            --gradient_accumulation_steps=1 \
+            --max_iters=5000 \
+            --lr_decay_iters=5000 \
+            --learning_rate=1e-3 \
+            --min_lr=6e-5 \
+            --eval_interval=250 \
+            --eval_iters=200 \
+            --use_moe=True \
+            --num_experts=$total \
+            --num_experts_per_tok=$active \
+            --norm_topk_prob=True \
+            --block_size=128 \
+            --block_k=128 \
+            --wandb_log=True \
+            --wandb_project="moe-wikitext-gridsearch" \
+            --wandb_run_name="$wandb_name" \
+            > logs/${wandb_name}.log 2>&1 &
+
+        echo $! >> $pidfile
+        gpu_idx=$(( (gpu_idx + 1) % 3 ))
+        sleep 10
+
+        # If we've launched 3 jobs, wait for one to finish before continuing
+        if [ $(wc -l < $pidfile) -eq 3 ]; then
+            echo "All 3 GPUs in use, waiting for a job to complete..."
+            wait -n $(cat $pidfile)
+            > $pidfile.tmp
+            while IFS= read -r pid; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "$pid" >> $pidfile.tmp
+                fi
+            done < $pidfile
+            mv $pidfile.tmp $pidfile
+        fi
+    done
+done
+
 # Wait for all remaining jobs to complete
 echo ""
 echo "All jobs launched. Waiting for remaining jobs to complete..."
@@ -140,4 +214,4 @@ rm -f $pidfile
 
 echo ""
 echo "Grid search complete!"
-echo "Total runs: 1 dense + 9 MoE configurations = 10 runs"
+echo "Total runs: 1 dense + 9 MoE + 7 tiny MoE = 17 runs"

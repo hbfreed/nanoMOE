@@ -1,18 +1,19 @@
 # nanoMoE
-Adding support for Mixture of Experts (MoE) models. 
+Adding support for Mixture of Experts (MoE) models to nanoGPT.
 For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.02060). 
 
 ![nanoMoE](assets/nanomoe.png)
 ## Goals
-- [ ] Train an MoE nanoGPT on shakespeare_char
-    - [ ] Val loss < 1.467 for ~10M active parameters
-    - [ ] Val loss ~= 1.467 for <10M active parameters
-- [ ] Must not use [for loops over the experts](https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L598C1-L598C51)
-    - [ ] Triton kernel version
+- [X] Train an MoE nanoGPT on wikitext (Note: I originally had this as the shakespeare dataset, but all these models overfit so much that I opted for a bigger dataset in wikitext)
+    - [X] Wikitext val loss < 3.6034 for ~ 13.77M active parameters
+    - [X] Wikitext val loss ~= 3.6034 for < 13.77M active parameters
+- [X] Must not use [for loops over the experts](https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L598C1-L598C51)
+    - [X] Triton kernel version (Done, but it's slow)
     - [ ] Megablocks version?
 - [ ] Train GPT-2 Size MoE on OWT/Fineweb (Stretch Goal if feeling frisky, probably would have to be ~125m *total*, would have to see how efficient we can really get to do ~125m active!)
 
 ## Architecture Decisions
+Almost all of the architectural decisions are based off of the OLMoE paper.
 
 ### Routing Strategy
 - **Router Type**: Top-k routing 
@@ -22,105 +23,57 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
   - Load balancing loss (coefficient ~0.01)
   - Router z-loss for stability (coefficient ~0.001)
 
-### Expert Configuration
-We'll do some ablations at the small scale to see what works well. 
-- **Expert granularity**: Replace FFN layers with MoE blocks
-- **Expert capacity**: Starting with 8 experts per layer, OLMoE uses 64.
-- **Active experts**: OLMoE uses 8, maybe start with 2?
-- **Expert architecture**: Standard FFN (up projection → activation → down projection)
-
 ### Efficient Batching Strategy
-- **Grouped dispatch**: Batch tokens by selected experts to avoid loops
-- **Capacity factor**: 1.25x to handle load imbalance
-- **Dropout**: Expert dropout during training (drop entire experts with p=0.1)
+- **Grouped dispatch**: [MegaBlocks](https://arxiv.org/pdf/2211.15841)-style computation of experts, avoiding loops over experts
 
 ## Ablation Studies (Controlling for Active Parameters)
+### Model Performance Results
+All of these models were trained on Wikitext for 5000 steps on a 3090. The batch size was 64. With substantially fewer active parameters (about 40% as many), we can beat the baseline dense model! This isn't exactly shocking, but still cool to see it work at this tiny scale.
 
-### 10M Active Parameter Studies
-| Config Name | Total Params | Active Params | Multiplier | Experts | Top-k | Notes |
-|-------------|--------------|---------------|------------|---------|-------|--------|
-| Dense-10M   | 10M          | 10M           | 1x         | 1       | 1     | Baseline |
-| MoE-4x2     | 20M          | 10M           | 2x         | 4       | 2     | |
-| MoE-8x2     | 40M          | 10M           | 4x         | 8       | 2     | OLMoE multiplier|
-| MoE-16x1    | 80M          | 10M           | 8x         | 16      | 2     | |
+Note that the number of active parameters varying is due to router overhead.
 
-### 50M Active Parameter Studies
-| Config Name | Total Params | Active Params | Multiplier | Experts | Top-k | Notes |
-|-------------|--------------|---------------|------------|---------|-------|--------|
-| Dense-50M   | 50M          | 50M           | 1x         | 1       | 1     | Baseline |
-| MoE-4x2     | 100M         | 50M           | 2x         | 4       | 2     | |
-| MoE-8x2     | 200M         | 50M           | 4x         | 8       | 2     | |
-| MoE-8x4     | 200M         | 50M           | 4x         | 8       | 4     | Higher k |
-| MoE-16x2    | 400M         | 50M           | 8x         | 16      | 2     | |
-| MoE-32x1    | 800M         | 50M           | 16x        | 32      | 2     | Extreme sparsity |
+The extra active parameters shouldn't really contribute to performance, but I've decided to keep them in because they *are* parameters that are being used during inference, so from an efficiency standpoint, it seems fair to keep them in. 
 
-## TODO
+The tables below are ordered from best performance to worst.[^1]
 
-### Implementation
-- [ ] Implement basic MoE layer with top-k routing
-- [ ] Add auxiliary losses (load balancing + router z-loss)
-- [ ] Implement expert capacity limits and overflow handling
-- [ ] Add grouped token dispatch (no loops!)
-- [ ] Implement expert dropout
-- [ ] Add router temperature scaling
-- [ ] Implement different routing strategies (could compare top-k vs expert choice)
+### Architecture: 6 Layers, 6 Heads 384 Hidden Size
 
-### Triton Implementation
-    #### Core Data Structures
-    - [ ] **Define BCSR format storage** - You'll need arrays for block data, column indices, row indices, and row offsets to efficiently store your sparse matrices
-    - [ ] **Set up block size constants** - Start with 128×128 blocks as the research shows this is optimal for GPU utilization
+| Model              | Total Params (M) | Active Params (M) | Best Val Loss |
+|--------------------|------------------|-------------------|---------------|
+| 64E-8A             | 82.33            | 16.27             | 3.3352        |
+| 32E-8A             | 44.51            | 16.20             | 3.3708        |
+| 64E-2A             | 233.33           | 13.92             | 3.3897        |
+| 64E-4A             | 120.08           | 13.92             | 3.3414        |
+| 32E-4A             | 63.39            | 13.84             | 3.3733        |
+| 32E-2A             | 120.01           | 13.84             | 3.3754        |
+| 16E-2A             | 63.35            | 13.80             | 3.3850        |
+| 16E-4A             | 35.04            | 13.80             | 3.4050        |
+| 8E-2A              | 35.02            | 13.79             | 3.4203        |
+| 16E-8A             | 25.60            | 16.16             | 3.4301        |
+| 8E-4A              | 20.86            | 13.79             | 3.4627        |
+| **Dense baseline** | 13.77          | 13.77             | 3.6034        |
 
-    #### Token Routing & Permutation
-    - [ ] **Implement token-to-expert sorting** - Sort tokens by their assigned experts so all tokens for expert 0 come first, then expert 1, etc.
-    - [ ] **Add padding logic** - Pad each expert's token group to the nearest block boundary (e.g., if expert has 150 tokens, pad to 256)
-    - [ ] **Create permutation tracking** - Keep track of original token positions so you can unpermute the outputs later
+### Architecture: 4 Layers, 4 Heads, 256 Hidden Size
 
-    #### SDD Kernel (Sparse = Dense × Dense)
-    - [ ] **Set up the kernel signature** - This takes your permuted tokens and first layer expert weights as dense matrices
-    - [ ] **Implement block iteration** - Loop through each non-zero block in your sparse output based on the topology
-    - [ ] **Add the core matmul** - Use Triton's `tl.dot` for the actual block matrix multiplication, accumulating results
+| Model              | Total Params (M) | Active Params (M) | Best Val Loss |
+|--------------------|------------------|-------------------|---------------|
+| 64E-4A             | 36.77            | 5.31              | 3.5829        |
+| 64E-8A             | 19.99            | 5.31              | 3.6252        |
+| 32E-4A             | 19.96            | 5.28              | 3.6309        |
+| 64E-2A             | 70.32            | 5.31              | 3.6344        |
+| 32E-2A             | 36.74            | 5.28              | 3.6372        |
+| 16E-2A             | 19.94            | 5.26              | 3.6583        |
+| 32E-8A             | 11.57            | 5.28              | 3.6736        |
+| 16E-4A             | 11.55            | 5.26              | 3.6842        |
+| 8E-2A              | 11.54            | 5.25              | 3.7022        |
+| 8E-4A              | 7.35             | 5.25              | 3.7377        |
+| 16E-8A             | 7.36             | 5.26              | 3.7486        |
 
-    #### DSD Kernel (Dense = Sparse × Dense)  
-    - [ ] **Create 2D grid structure** - Unlike SDD, this needs a 2D grid to handle the dense output efficiently
-    - [ ] **Implement row-wise iteration** - For each output row, iterate through all sparse blocks in that row
-    - [ ] **Handle output accumulation** - Sum contributions from each sparse block to produce the final dense output
 
-    #### Dynamic Topology Creation
-    - [ ] **Count tokens per expert** - Use the routing assignments to determine how many blocks each expert needs
-    - [ ] **Build sparse indices** - Generate the row/column index arrays that define which blocks are non-zero
-    - [ ] **Handle variable sizes** - Ensure your topology can adapt to different expert loads dynamically
 
-    #### Integration Points
-    - [ ] **Replace your loop-based implementation** - Swap out the for-loop over experts with calls to your SDD/DSD kernels
-    - [ ] **Add autotuning configs** - Set up Triton autotuning with different block sizes and stage counts
-    - [ ] **Implement fallback handling** - Have a plan for edge cases like empty experts or very small batch sizes
 
-    #### Testing & Validation
-    - [ ] **Unit test each kernel** - Verify SDD and DSD produce correct results compared to naive implementation
-    - [ ] **Profile memory usage** - Ensure you're actually saving memory compared to dense computation
-    - [ ] **Benchmark throughput** - Measure FLOPS and compare to your baseline implementation
 
-    Start with the SDD kernel since it's conceptually simpler (you control where outputs go), then tackle DSD once you're comfortable with the block-sparse concepts.
-
-### Optimization
-- [ ] Profile memory usage vs dense model
-- [ ] Implement gradient checkpointing for MoE layers
-- [ ] Add mixed precision support
-- [ ] Benchmark routing overhead
-- [ ] Compare communication patterns for different expert layouts
-
-### Validation
-- [ ] Track per-expert utilization
-- [ ] Monitor routing entropy
-- [ ] Visualize routing patterns over training
-- [ ] Compare active parameters vs total parameters
-- [ ] Ablation: number of experts vs performance
-
-### Scaling Tests
-- [ ] Start with 2 experts, scale to 8
-- [ ] Test different k values (1, 2, 4)
-- [ ] Compare dense vs MoE at same active parameters
-- [ ] Test on different sequence lengths
+[^1]: Apologies for the Mixtral-style model naming, but it was the easiest way to keep track of which one was which. The Qwen-style, Number of Total Parameters - Number of Active parameters is way nicer in my opinion.
 
 # nanoGPT
 

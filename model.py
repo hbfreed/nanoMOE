@@ -169,7 +169,42 @@ class MoeMLPForLoop(nn.Module):
         
         return output.view(batch_size, seq_len, hidden_dim), aux_loss, f_i
 
+import numpy as np
+import stk.ops
+import torch
+from stk import Matrix
+
+import megablocks.ops as ops
+from megablocks.layers import common, dmlp_registry, moe, mpu
+from megablocks.layers.arguments import Arguments
+
+
+def promote_scalar(x):
+    return x.view(1) if not len(x.size()) else x
+
 class MoeMegaBlocks(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
+        self.n_embd = config.n_embd #hidden size
+        self.seq_len = config.n_ctx
+
+        d_ffn = 4 * self.n_embd // self.num_experts_per_tok
+        self.block_size = config.block_size  # Triton kernel block size, NOT sequence length!
+        self.d_ffn = ((d_ffn + self.block_size - 1) // self.block_size) * self.block_size
+        self.block_k = config.block_k
+
+        self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
+        self.w1 = nn.Parameter(torch.empty(self.n_embd, self.d_ffn * self.num_experts))
+        self.w2 = nn.Parameter(torch.empty(self.d_ffn * self.num_experts, self.n_embd))
+
+        nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
+        nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
+
+
 
 class MoeMLPSTK(nn.Module):
 
@@ -732,7 +767,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if config.use_moe:
-            self.mlp = MoeMLP(config)
+            self.mlp = MoeMLPSTK(config)
         else:
             self.mlp = MLP(config)
 

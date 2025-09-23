@@ -16,14 +16,14 @@ num_experts = 64
 num_experts_per_tok = 8
 norm_topk_prob = True
 block_size = 128
-block_k = 64
+block_k = 32
 
 batch_size = 64
 n_ctx = 256
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 3 
 
-max_iters = 1000
-lr_decay_iters = 1000
+max_iters = 5000
+lr_decay_iters = 5000
 
 # Eval
 eval_interval = 250

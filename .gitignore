@@ -11,8 +11,10 @@ input.txt
 env/
 venv/
 wandb/
+logs/
 *_trace.json
 *.stats
 *.hatchet
 *.ncu-rep
 *.prof
+*.csv
