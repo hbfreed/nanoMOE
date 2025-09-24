@@ -172,7 +172,7 @@ class MoeMLPForLoop(nn.Module):
 import numpy as np
 import stk
 from megablocks import ops
-from megablocks.layers.gelu import gelu
+
 @torch.compiler.disable
 class MoeMLPMegaBlocks(nn.Module):
 
@@ -181,12 +181,10 @@ class MoeMLPMegaBlocks(nn.Module):
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.n_embd = config.n_embd
-        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         
         # FIX: Ensure d_ffn is divisible by blocking (128) to avoid Triton kernel issues
         self.blocking = 128
-        base_d_ffn = 4 * self.n_embd // self.num_experts_per_tok
-
+        base_d_ffn = config.n_embd * 4
         # Round up d_ffn to nearest multiple of blocking
         self.d_ffn = ((base_d_ffn + self.blocking - 1) // self.blocking) * self.blocking
 
@@ -194,8 +192,6 @@ class MoeMLPMegaBlocks(nn.Module):
 
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.num_experts * self.d_ffn))
         self.w2 = nn.Parameter(torch.empty(self.num_experts * self.d_ffn, self.n_embd))
-        # self.w1 = nn.Parameter(torch.empty(self.num_experts * self.d_ffn, self.n_embd))
-        # self.w2 = nn.Parameter(torch.empty(self.n_embd, self.num_experts * self.d_ffn))
                 
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
@@ -208,27 +204,19 @@ class MoeMLPMegaBlocks(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
-
+        
+        # Use rearrange to flatten batch and sequence dimensions
         x_flat = rearrange(x, 'batch_size seq_len n_embd -> (batch_size seq_len) n_embd')  # [batch*seq, n_embd]
 
         router_logits = self.router(x_flat)
+        expert_weights, selected_experts = torch.topk(router_logits, self.num_experts_per_tok, dim=-1)
 
-        # FIX: Apply softmax BEFORE topk to match STK behavior
-        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float)  # Use float32 for stability
-
-        # Select top-k experts based on probabilities
-        expert_weights, selected_experts = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
-
-        # Normalize the top-k weights to sum to 1
-        if self.norm_topk_prob:
-            expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
-
-        # Convert back to model dtype
-        expert_weights = expert_weights.to(x.dtype)
+        expert_weights = F.softmax(expert_weights, dim=-1)
 
         expert_weights_flat = rearrange(expert_weights, '... -> (...)')
         selected_experts_flat = rearrange(selected_experts, '... -> (...)')
         
+        # FIX: Early exit if no tokens to route
         if selected_experts_flat.numel() == 0:
             output = torch.zeros((batch_size, seq_len, self.n_embd), dtype=x.dtype, device=x.device)
             aux_loss = {
@@ -240,6 +228,7 @@ class MoeMLPMegaBlocks(nn.Module):
         
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(selected_experts_flat)
 
+        # FIX: Check if any experts have tokens
         if tokens_per_expert.sum() == 0:
             output = torch.zeros((batch_size, seq_len, self.n_embd), dtype=x.dtype, device=x.device)
             aux_loss = {
@@ -253,20 +242,22 @@ class MoeMLPMegaBlocks(nn.Module):
 
         x_permuted = self._gather_tokens(x_flat, indices, bin_ids, tokens_per_expert, padded_bins)
         
+        # FIX: Ensure x_permuted matches topology shape
         if x_permuted.shape[0] != topology.shape[0]:
             if x_permuted.shape[0] < topology.shape[0]:
+                # Pad with zeros if too small
                 padding = torch.zeros((topology.shape[0] - x_permuted.shape[0], x_permuted.shape[1]),
                                      dtype=x_permuted.dtype, device=x_permuted.device)
                 x_permuted = torch.cat([x_permuted, padding], dim=0)
             else:
+                # Truncate if too large
                 x_permuted = x_permuted[:topology.shape[0]]
 
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
-
-        x_permuted = gelu(x_permuted) #vanilla torch gelu breaks the gradient flow
+        x_permuted = F.gelu(x_permuted.data)
 
         x_permuted = stk.ops.dsd(
-            x_permuted, #stk.Matrix(topology.shape, x_permuted, *self._get_topo_tensors(topology)),
+            stk.Matrix(topology.shape, x_permuted, *self._get_topo_tensors(topology)),
             self.w2
         )
 
@@ -274,28 +265,32 @@ class MoeMLPMegaBlocks(nn.Module):
             x_permuted, indices, bin_ids, expert_weights_flat, tokens_per_expert, padded_bins
         )
         
+        # Reshape back using rearrange
         output = rearrange(
             x_permuted,
             '(batch_size seq_len) n_embd -> batch_size seq_len n_embd',
             batch_size=batch_size,
             seq_len=seq_len
         )
-
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean() # router z-loss keeps router logits small
         
+        # Load balance loss: encourages uniform distribution across experts
         p_i = F.softmax(router_logits, dim=-1)  # Shape: (batch*seq, num_experts)
         p_i = p_i.mean(dim=0)  # Average probability per expert: (num_experts,)
         
         if len(selected_experts) > 0:
             experts_flat = selected_experts.flatten()
+
             f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
             ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
             f_i.scatter_add_(0, experts_flat, ones)
             load_balance_loss = self.num_experts * (f_i @ p_i)
         else:
+            # No tokens routed - no imbalance possible
             load_balance_loss = torch.tensor(0.0, device=x.device)
             f_i = torch.zeros(self.num_experts, device=x.device)
         
+        # Package auxiliary losses for the training script
         aux_loss = {
             'router_z_loss': router_z_loss,
             'load_balance_loss': load_balance_loss,
@@ -337,9 +332,6 @@ class MoeMLPMegaBlocks(nn.Module):
             dtype=torch.int32, device=x.device
         )
 
-        column_indices = column_indices.to(torch.int32)
-        offsets = offsets.to(torch.int32)
-
         shape = (padded_tokens, self.d_ffn * self.num_experts)
 
         # FIX: Handle empty topology case properly
@@ -358,14 +350,10 @@ class MoeMLPMegaBlocks(nn.Module):
             column_indices = torch.zeros(1, dtype=torch.int32, device=x.device)
 
         row_indices = stk.ops.row_indices(shape, data_placeholder, offsets, column_indices)
-        row_indices = row_indices.to(torch.int32)
 
         column_indices_t, offsets_t, block_offsets_t = self._sparse_transpose(
             shape, row_indices, column_indices, offsets, padded_tokens_per_expert
         )
-        column_indices_t = column_indices_t.to(torch.int32)
-        offsets_t = offsets_t.to(torch.int32)
-        block_offsets_t = column_indices_t.to(torch.int32)
 
         topology = stk.Matrix(
             shape, data_placeholder, row_indices, column_indices,
@@ -443,7 +431,6 @@ class MoeMLPMegaBlocks(nn.Module):
             topology.offsets_t,
             topology.block_offsets_t
         )
-
 
 class MoeMLPSTK(nn.Module):
 
@@ -622,11 +609,7 @@ class MoeMLPSTK(nn.Module):
     def _run_stk_ops(self, x_padded, tokens_per_expert_padded):
         """Run STK operations without compilation to avoid recompilation overhead."""
         topo = self._make_topology(x_padded, tokens_per_expert_padded)
-        print("  topology.size:", topo.size)
-        print("  topology.data:", topo.data)
-        print("  topology.row_indices:", topo.row_indices)
-        print("  topology.column_indices:", topo.column_indices)
-        print("  topology.offsets:", topo.offsets)
+
         block_sparse = stk.ops.sdd(x_padded, self.w1, topo)
         activated_blocks = F.gelu(block_sparse.data)
         block_sparse = stk.matrix.Matrix(
@@ -1020,7 +1003,6 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if config.use_moe:
-            # self.mlp = MoeMLPSTK(config)
             self.mlp = MoeMLPMegaBlocks(config)
         else:
             self.mlp = MLP(config)

@@ -76,7 +76,8 @@ def sdd_kernel(
         acc += tl.dot(x_tile, w1_tile)
     
     # Store BLOCK_SIZE x BLOCK_SIZE output block
-    # Use output_col_idx for compact output (no expert offset!)
+    # Use row_idx for row position (same token block writes to same rows)
+    # Use output_col_idx for compact column storage
     output_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
     output_col_offsets = output_col_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
     output_ptrs = output_ptr + output_row_offsets * stride_om + output_col_offsets * stride_on
@@ -138,6 +139,7 @@ def dsd_kernel(
     
     for k in range(0, d_ffn, BLOCK_K):
         # Load BLOCK_SIZE x BLOCK_K tile from input
+        # Use row_idx to read from the correct token block
         x_row_offsets = row_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[:, None]
         x_col_offsets = k + tl.arange(0, BLOCK_K)[None, :]
         
@@ -145,7 +147,7 @@ def dsd_kernel(
         # Need to mask both dimensions - x might have padded tokens
         x_mask = (x_col_offsets < d_ffn)
         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
-        x_tile = gelu_sigmoid(x_tile)
+        # x_tile = gelu_sigmoid(x_tile)
 
         # w2 weights for this expert start at expert_id * d_ffn
         w2_row_offsets = expert_id * d_ffn + k + tl.arange(0, BLOCK_K)[:, None]
@@ -491,7 +493,7 @@ class SDD(torch.autograd.Function):
         batch_size, hidden_size = x.shape
         num_experts_times_dffn = w1.shape[1]
         num_blocks = len(row_indices)
-        
+
         # Use the provided num_ffn_blocks to determine output width
         # This avoids data-dependent operations for torch.compile
         if num_ffn_blocks is None:
@@ -505,9 +507,15 @@ class SDD(torch.autograd.Function):
                 output_width = block_size
         else:
             output_width = num_ffn_blocks * block_size
-        
-        # Allocate output tensor (compact storage)
-        output = torch.zeros((batch_size, output_width), dtype=x.dtype, device=x.device)
+
+        # Allocate output tensor (need space for all token positions referenced by row_indices)
+        # row_indices contains positions in the padded tensor, so we need to accommodate the max position
+        if len(row_indices) > 0:
+            max_row_idx = row_indices.max().item()
+            output_rows = (max_row_idx + 1) * block_size
+        else:
+            output_rows = block_size
+        output = torch.zeros((output_rows, output_width), dtype=x.dtype, device=x.device)
         
         # Configure grid
         grid = (num_blocks,)
@@ -617,26 +625,37 @@ class DSD(torch.autograd.Function):
     
     @staticmethod
     @torch.compiler.disable
-    def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=128):
+    def forward(ctx, x, w2, row_indices, weight_row_indices, output_col_indices, block_size=128, total_padded_tokens=None):
         """
         Args:
-            x: Sparse input tensor in compact form (num_padded_tokens, d_ffn_compact)
+            x: Sparse input tensor in compact form (num_blocks * block_size, d_ffn_compact)
             w2: Dense weight tensor (num_experts * d_ffn, hidden_size)
-            row_indices: Which token blocks to process
+            row_indices: Which token blocks to process (indexes into padded tensor)
             weight_row_indices: Which expert weights to use
             output_col_indices: Position in compact storage (from SDD)
             block_size: Block size for Triton kernel
-        
+            total_padded_tokens: Total number of padded tokens for output allocation
+
         Returns:
-            Dense output (num_padded_tokens, hidden_size)
+            Dense output (total_padded_tokens, hidden_size)
         """
-        batch_size = x.shape[0]
+        # x is now compact: (num_blocks * block_size, d_ffn)
+        compact_batch_size = x.shape[0]
         d_ffn = x.shape[1]
         hidden_size = w2.shape[1]
-        num_blocks = len(row_indices)#(row_indices != 0).sum()
-        
-        # Allocate dense output
-        output = torch.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device)
+        num_blocks = len(row_indices)
+
+        # For output, we need the full padded size (to write back to correct positions)
+        if total_padded_tokens is None:
+            # If not provided, infer from the maximum row index
+            if len(row_indices) > 0:
+                max_row_idx = row_indices.max().item()
+                total_padded_tokens = (max_row_idx + 1) * block_size
+            else:
+                total_padded_tokens = block_size
+
+        # Allocate dense output for all padded tokens
+        output = torch.zeros((total_padded_tokens, hidden_size), dtype=x.dtype, device=x.device)
         
         # Configure grid - need to tile over hidden_size dimension
         hidden_tiles = math.ceil(hidden_size / block_size)

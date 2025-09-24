@@ -121,8 +121,12 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance
-torch.backends.cudnn.conv.fp32_precision = 'tf32' # Use TF32 for cudnn operations
+
+#TODO: When we upgrade to higher pytorch versions, switch to this.
+# torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance
+# torch.backends.cudnn.conv.fp32_precision = 'tf32' # Use TF32 for cudnn operations
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
@@ -451,7 +455,7 @@ while True:
         
         # Log cross-entropy loss separately if available
         if combined_aux_loss is not None and 'ce_loss' in combined_aux_loss:
-            ce_lossf = combined_aux_loss['ce_loss'].item() * gradient_accumulation_steps
+            ce_lossf = combined_aux_loss['ce_loss'].item()  # CE loss is already unscaled
             print(f"iter {iter_num}: loss {lossf:.4f}, ce_loss {ce_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         else:
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
