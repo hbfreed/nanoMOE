@@ -361,7 +361,7 @@ class MoeMLPMegaBlocks(nn.Module):
         row_indices = row_indices.to(torch.int32)
 
         column_indices_t, offsets_t, block_offsets_t = self._sparse_transpose(
-            shape, row_indices, column_indices, offsets, padded_tokens_per_expert
+            shape, row_indices, column_indices
         )
         column_indices_t = column_indices_t.to(torch.int32)
         offsets_t = offsets_t.to(torch.int32)
@@ -374,28 +374,25 @@ class MoeMLPMegaBlocks(nn.Module):
 
         return padded_bins, topology
 
-    def _sparse_transpose(self, shape, row_indices, column_indices, offsets, padded_tokens_per_expert):
-        block_columns = shape[1] // self.blocking
-        
-        # FIX: Handle empty topology case
-        if column_indices.numel() == 0:
+    def _sparse_transpose(self, size, row_indices, column_indices):
+            block_columns = size[1] // self.blocking
+
+            _, gather_indices = ops.sort(
+                column_indices.int(),
+                self.transpose_sort_end_bit,
+            )
+
+            column_indices_t = row_indices.gather(0, gather_indices.long())
+            block_offsets_t = gather_indices.int()
+
             zero = torch.zeros((1,), dtype=torch.int32, device=row_indices.device)
-            return column_indices, torch.cat([zero, zero]), column_indices
-
-        _, gather_indices = ops.sort(column_indices.int(), self.transpose_sort_end_bit)
-
-        column_indices_t = row_indices.gather(0, gather_indices.long())
-        block_offsets_t = gather_indices.int()
-
-        zero = torch.zeros((1,), dtype=torch.int32, device=row_indices.device)
-        nnz_per_column = ops.histogram(column_indices, block_columns)
-        nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
-        nnz_per_column = nnz_per_column.contiguous()
-        if nnz_per_column.dim() == 0:
-            nnz_per_column = nnz_per_column.unsqueeze(0)
-        offsets_t = torch.cat([zero, nnz_per_column])
-
-        return column_indices_t, offsets_t, block_offsets_t
+            nnz_per_column = ops.histogram(column_indices, block_columns)
+            nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
+            if nnz_per_column.dim() == 0:
+                # This addresses an edge case when ffn_hidden_size is equal to self.blocking.
+                nnz_per_column = nnz_per_column.unsqueeze(0)
+            offsets_t = torch.cat([zero, nnz_per_column])
+            return column_indices_t, offsets_t, block_offsets_t
 
     def _gather_tokens(self, x, indices, bin_ids, tokens_per_expert, padded_bins):
         bins = ops.inclusive_cumsum(tokens_per_expert, 0)
@@ -432,7 +429,7 @@ class MoeMLPMegaBlocks(nn.Module):
             padded_bins,
             self.num_experts_per_tok
         )
-
+    
     def _get_topo_tensors(self, topology):
         """Extract the tensor components from STK Matrix for reconstruction."""
         return (
@@ -443,7 +440,6 @@ class MoeMLPMegaBlocks(nn.Module):
             topology.offsets_t,
             topology.block_offsets_t
         )
-
 
 class MoeMLPSTK(nn.Module):
 
@@ -622,23 +618,8 @@ class MoeMLPSTK(nn.Module):
     def _run_stk_ops(self, x_padded, tokens_per_expert_padded):
         """Run STK operations without compilation to avoid recompilation overhead."""
         topo = self._make_topology(x_padded, tokens_per_expert_padded)
-        print("  topology.size:", topo.size)
-        print("  topology.data:", topo.data)
-        print("  topology.row_indices:", topo.row_indices)
-        print("  topology.column_indices:", topo.column_indices)
-        print("  topology.offsets:", topo.offsets)
         block_sparse = stk.ops.sdd(x_padded, self.w1, topo)
-        activated_blocks = F.gelu(block_sparse.data)
-        block_sparse = stk.matrix.Matrix(
-            size=block_sparse.size(),
-            data=activated_blocks,
-            row_indices=block_sparse.row_indices,
-            column_indices=block_sparse.column_indices,
-            offsets=block_sparse.offsets,
-            column_indices_t=block_sparse.column_indices_t,
-            offsets_t=block_sparse.offsets_t,
-            block_offsets_t=block_sparse.block_offsets_t,
-        )
+        block_sparse = gelu(block_sparse)
         expert_output = stk.ops.dsd(block_sparse, self.w2)
         return expert_output
 
@@ -726,6 +707,7 @@ class MoeMLPSTK(nn.Module):
         }
         
         return output, aux_loss, f_i 
+
 class MoeMLP(nn.Module):
     
     def __init__(self, config):
