@@ -173,7 +173,6 @@ import numpy as np
 import stk
 from megablocks import ops
 from megablocks.layers.gelu import gelu
-@torch.compiler.disable
 class MoeMLPMegaBlocks(nn.Module):
 
     def __init__(self, config):
@@ -183,29 +182,28 @@ class MoeMLPMegaBlocks(nn.Module):
         self.n_embd = config.n_embd
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         
-        # FIX: Ensure d_ffn is divisible by blocking (128) to avoid Triton kernel issues
-        self.blocking = 128
+        # Use block_size from config instead of hardcoded blocking
+        self.block_size = config.block_size
         base_d_ffn = 4 * self.n_embd // self.num_experts_per_tok
 
-        # Round up d_ffn to nearest multiple of blocking
-        self.d_ffn = ((base_d_ffn + self.blocking - 1) // self.blocking) * self.blocking
+        # Round up d_ffn to nearest multiple of block_size
+        self.d_ffn = ((base_d_ffn + self.block_size - 1) // self.block_size) * self.block_size
 
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
 
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.num_experts * self.d_ffn))
         self.w2 = nn.Parameter(torch.empty(self.num_experts * self.d_ffn, self.n_embd))
-        # self.w1 = nn.Parameter(torch.empty(self.num_experts * self.d_ffn, self.n_embd))
-        # self.w2 = nn.Parameter(torch.empty(self.n_embd, self.num_experts * self.d_ffn))
                 
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
 
         self.sort_end_bit = max(int(np.ceil(np.log2(self.num_experts))),1)
 
-        max_column_index = (self.d_ffn * self.num_experts) // self.blocking
+        max_column_index = (self.d_ffn * self.num_experts) // self.block_size
 
         self.transpose_sort_end_bit = max(int(np.ceil(np.log2(max_column_index))),1)
 
+    @torch.compiler.disable
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
 
@@ -238,6 +236,7 @@ class MoeMLPMegaBlocks(nn.Module):
             f_i = torch.zeros(self.num_experts, device=x.device)
             return output, aux_loss, f_i
         
+
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(selected_experts_flat)
 
         if tokens_per_expert.numel() == 0 or not tokens_per_expert.any():
@@ -256,24 +255,24 @@ class MoeMLPMegaBlocks(nn.Module):
         if x_permuted.shape[0] != topology.shape[0]:
             if x_permuted.shape[0] < topology.shape[0]:
                 padding = torch.zeros((topology.shape[0] - x_permuted.shape[0], x_permuted.shape[1]),
-                                     dtype=x_permuted.dtype, device=x_permuted.device)
+                                    dtype=x_permuted.dtype, device=x_permuted.device)
                 x_permuted = torch.cat([x_permuted, padding], dim=0)
             else:
                 x_permuted = x_permuted[:topology.shape[0]]
 
         x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
 
-        x_permuted = gelu(x_permuted) #vanilla torch gelu breaks the gradient flow
+        x_permuted = gelu(x_permuted)
 
         x_permuted = stk.ops.dsd(
-            x_permuted, #stk.Matrix(topology.shape, x_permuted, *self._get_topo_tensors(topology)),
+            x_permuted,
             self.w2
         )
 
         x_permuted = self._scatter_tokens(
             x_permuted, indices, bin_ids, expert_weights_flat, tokens_per_expert, padded_bins
         )
-        
+            
         output = rearrange(
             x_permuted,
             '(batch_size seq_len) n_embd -> batch_size seq_len n_embd',
@@ -313,7 +312,7 @@ class MoeMLPMegaBlocks(nn.Module):
 
     def _create_topology(self, x, tokens_per_expert):
 
-        padded_tokens_per_expert = ops.round_up(tokens_per_expert, self.blocking)
+        padded_tokens_per_expert = ops.round_up(tokens_per_expert, self.block_size)
         padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
         padded_bins = padded_bins.contiguous()
 
@@ -326,15 +325,15 @@ class MoeMLPMegaBlocks(nn.Module):
             padded_tokens_tensor = padded_bins[-1]
             padded_tokens = int(padded_tokens_tensor)
         else:
-            padded_tokens = self.blocking
+            padded_tokens = self.block_size
 
-        padded_tokens = max(padded_tokens, self.blocking)  # Ensure minimum size
+        padded_tokens = max(padded_tokens, self.block_size)  # Ensure minimum size
         
-        block_rows = padded_tokens // self.blocking
-        blocks_per_row = self.d_ffn // self.blocking  # Now guaranteed to be integer
+        block_rows = padded_tokens // self.block_size
+        blocks_per_row = self.d_ffn // self.block_size  # Now guaranteed to be integer
 
         column_indices = ops.topology(
-            padded_bins, self.blocking, block_rows, blocks_per_row
+            padded_bins, self.block_size, block_rows, blocks_per_row
         )
 
         offsets = torch.arange(
@@ -347,17 +346,16 @@ class MoeMLPMegaBlocks(nn.Module):
 
         shape = (padded_tokens, self.d_ffn * self.num_experts)
 
-        # FIX: Handle empty topology case properly
         num_blocks = column_indices.numel()
         if num_blocks > 0:
             data_placeholder = torch.empty(
-                num_blocks, self.blocking, self.blocking,
+                num_blocks, self.block_size, self.block_size,
                 dtype=x.dtype, device='meta'
             )
         else:
             # Create minimal valid topology for empty case
             data_placeholder = torch.empty(
-                1, self.blocking, self.blocking,
+                1, self.block_size, self.block_size,
                 dtype=x.dtype, device='meta'
             )
             column_indices = torch.zeros(1, dtype=torch.int32, device=x.device)
@@ -380,7 +378,7 @@ class MoeMLPMegaBlocks(nn.Module):
         return padded_bins, topology
 
     def _sparse_transpose(self, size, row_indices, column_indices):
-            block_columns = size[1] // self.blocking
+            block_columns = size[1] // self.block_size
 
             _, gather_indices = ops.sort(
                 column_indices.int(),
@@ -394,7 +392,7 @@ class MoeMLPMegaBlocks(nn.Module):
             nnz_per_column = ops.histogram(column_indices, block_columns)
             nnz_per_column = ops.inclusive_cumsum(nnz_per_column, 0)
             if nnz_per_column.dim() == 0:
-                # This addresses an edge case when ffn_hidden_size is equal to self.blocking.
+                # This addresses an edge case when ffn_hidden_size is equal to self.block_size.
                 nnz_per_column = nnz_per_column.unsqueeze(0)
             offsets_t = torch.cat([zero, nnz_per_column])
             return column_indices_t, offsets_t, block_offsets_t

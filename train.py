@@ -262,17 +262,21 @@ def estimate_loss():
             X, Y = get_batch(split)
             with ctx:
                 logits, loss, aux_losses = model(X, Y)
-            losses[k] = loss.item()
-            
             if aux_losses is not None:
-                load_balance_losses[k] = aux_losses['load_balance_loss'].item()
-                router_z_losses[k] = aux_losses['router_z_loss'].item()
+                # Batch all .item() calls together
+                items_to_extract = [loss, aux_losses['load_balance_loss'], aux_losses['router_z_loss']]
                 if 'ce_loss' in aux_losses:
-                    ce_losses[k] = aux_losses['ce_loss'].item()
+                    items_to_extract.append(aux_losses['ce_loss'])
+                    extracted = [t.item() for t in items_to_extract]
+                    losses[k], load_balance_losses[k], router_z_losses[k], ce_losses[k] = extracted
                 else:
-                    ce_losses[k] = loss.item()  # For dense models, total loss is CE loss
+                    extracted = [t.item() for t in items_to_extract]
+                    losses[k], load_balance_losses[k], router_z_losses[k] = extracted
+                    ce_losses[k] = losses[k]  # For dense models, total loss is CE loss
             else:
-                ce_losses[k] = loss.item()  # For dense models, total loss is CE loss
+                loss_val = loss.item()
+                losses[k] = loss_val
+                ce_losses[k] = loss_val  # For dense models, total loss is CE loss
         
         out[split] = losses.mean()
         out[f'{split}_ce'] = ce_losses.mean()
@@ -381,19 +385,25 @@ while True:
             
             # Log step-level auxiliary losses if available
             if combined_aux_loss is not None:
-                log_dict["train/load_balance_loss_step"] = combined_aux_loss['load_balance_loss'].item()
-                log_dict["train/router_z_loss_step"] = combined_aux_loss['router_z_loss'].item()
-                
+                # Batch extract auxiliary losses
+                aux_items = [combined_aux_loss['load_balance_loss'], combined_aux_loss['router_z_loss']]
+                aux_extracted = [t.item() for t in aux_items]
+                log_dict["train/load_balance_loss_step"] = aux_extracted[0]
+                log_dict["train/router_z_loss_step"] = aux_extracted[1]
+
                 if 'expert_usage' in combined_aux_loss:
                     expert_usage = combined_aux_loss['expert_usage']
-                    for i, usage in enumerate(expert_usage):
-                        log_dict[f"expert_usage/expert_{i}"] = usage.item()
-                    
+                    # Batch extract all expert usage values at once
+                    expert_usage_list = expert_usage.tolist()  # Single GPU sync for all values
+                    for i, usage in enumerate(expert_usage_list):
+                        log_dict[f"expert_usage/expert_{i}"] = usage
+
                     # Monitor for expert collapse
-                    max_usage = expert_usage.max().item()
+                    max_usage = max(expert_usage_list)
+                    max_idx = expert_usage_list.index(max_usage)
                     log_dict["expert_usage/max_usage"] = max_usage
                     if max_usage > 0.5:
-                        print(f"WARNING: Expert collapse detected! Expert {expert_usage.argmax().item()} has {max_usage:.1%} of tokens")
+                        print(f"WARNING: Expert collapse detected! Expert {max_idx} has {max_usage:.1%} of tokens")
             
             wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
@@ -446,18 +456,25 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        
-        # Log cross-entropy loss separately if available
+        # Batch extract losses to minimize CPU-GPU sync points
         if combined_aux_loss is not None and 'ce_loss' in combined_aux_loss:
-            ce_lossf = combined_aux_loss['ce_loss'].item()  # CE loss is already unscaled
+            # Extract both losses in one go
+            loss_val, ce_loss_val = loss.item(), combined_aux_loss['ce_loss'].item()
+            lossf = loss_val * gradient_accumulation_steps
+            ce_lossf = ce_loss_val  # CE loss is already unscaled
+
+            if local_iter_num >= 5: # let the training loop settle a bit
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+
             print(f"iter {iter_num}: loss {lossf:.4f}, ce_loss {ce_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         else:
+            lossf = loss.item() * gradient_accumulation_steps
+
+            if local_iter_num >= 5: # let the training loop settle a bit
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1

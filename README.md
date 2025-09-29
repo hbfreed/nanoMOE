@@ -28,7 +28,7 @@ Almost all of the architectural decisions are based off of the OLMoE paper.
 
 ## Ablation Studies (Controlling for Active Parameters)
 ### Model Performance Results
-All of these models were trained on Wikitext for 5000 steps on a 3090. The batch size was 64. With substantially fewer active parameters (about 40% as many), we can beat the baseline dense model! This isn't exactly shocking, but still cool to see it work at this tiny scale.
+All of these models were trained on Wikitext with a vocabulary size of 8192 for 5000 steps on a 3090. The batch size was 64. With substantially fewer active parameters (about 40% as many), we can beat the baseline dense model! This isn't exactly shocking, but still cool to see it work at this tiny scale.
 
 Note that the number of active parameters varying is due to router overhead.
 

@@ -9,8 +9,8 @@ bias = False
 
 # MoE configuration
 use_moe = True 
-num_experts = 32 
-num_experts_per_tok = 4
+num_experts = 64 
+num_experts_per_tok = 8
 norm_topk_prob = True
 block_size = 128
 block_k = 32
