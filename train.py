@@ -45,7 +45,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # profiling
-profile_enabled = False # True # Set to True to enable cProfile profiling
+profile_enabled = True # Set to True to enable cProfile profiling
 profile_iterations = -1  # Number of iterations to profile (set to -1 for all)
 profile_output = 'profile_stats.prof'  # Output file for profiling results
 # wandb logging

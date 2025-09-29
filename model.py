@@ -240,7 +240,7 @@ class MoeMLPMegaBlocks(nn.Module):
         
         bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(selected_experts_flat)
 
-        if tokens_per_expert.sum() == 0:
+        if tokens_per_expert.numel() == 0 or not tokens_per_expert.any():
             output = torch.zeros((batch_size, seq_len, self.n_embd), dtype=x.dtype, device=x.device)
             aux_loss = {
                 'router_z_loss': torch.tensor(0.0, device=x.device),
@@ -312,6 +312,7 @@ class MoeMLPMegaBlocks(nn.Module):
         return bin_ids, indices, tokens_per_expert
 
     def _create_topology(self, x, tokens_per_expert):
+
         padded_tokens_per_expert = ops.round_up(tokens_per_expert, self.blocking)
         padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
         padded_bins = padded_bins.contiguous()
@@ -321,8 +322,12 @@ class MoeMLPMegaBlocks(nn.Module):
         elif padded_bins.dim() == 0:
             padded_bins = padded_bins.unsqueeze(0)
 
-        # FIX: Ensure padded_tokens is at least blocking size to avoid empty topology
-        padded_tokens = padded_bins[-1].item() if padded_bins.numel() > 0 else self.blocking
+        if padded_bins.numel() > 0:
+            padded_tokens_tensor = padded_bins[-1]
+            padded_tokens = int(padded_tokens_tensor)
+        else:
+            padded_tokens = self.blocking
+
         padded_tokens = max(padded_tokens, self.blocking)  # Ensure minimum size
         
         block_rows = padded_tokens // self.blocking
@@ -365,7 +370,7 @@ class MoeMLPMegaBlocks(nn.Module):
         )
         column_indices_t = column_indices_t.to(torch.int32)
         offsets_t = offsets_t.to(torch.int32)
-        block_offsets_t = column_indices_t.to(torch.int32)
+        block_offsets_t = block_offsets_t.to(torch.int32)
 
         topology = stk.Matrix(
             shape, data_placeholder, row_indices, column_indices,
