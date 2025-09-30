@@ -2,22 +2,24 @@
 # launch as the following (e.g. in a screen session) and wait ~5 days:
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
+out_dir = 'out-chinchilla/dense-baseline'
+
 wandb_log = True
-wandb_project = 'owt'
-wandb_run_name='gpt2-124M'
+wandb_project = 'gpt2-chinchilla'
+wandb_run_name = 'dense-baseline'
 
 # these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
+# 12 batch size * 1024 block size *13 gradaccum * 3 GPUs = 479,232
 batch_size = 12
 n_ctx = 1024
-gradient_accumulation_steps = 5 * 8
+gradient_accumulation_steps = 13 * 3
 
-# this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+# 5217 gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion)
+max_iters = 5217 
+lr_decay_iters = 5217
 
 # eval stuff
-eval_interval = 1000
+eval_interval = 500 
 eval_iters = 200
 log_interval = 10
 

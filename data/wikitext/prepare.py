@@ -4,7 +4,6 @@
 import os
 from tqdm import tqdm
 import numpy as np
-from tiktoken._educational import bpe_train, SimpleBytePairEncoding
 from tokenizers.trainers import BpeTrainer
 from tokenizers import Tokenizer, pre_tokenizers, models, decoders, processors
 import pickle

@@ -45,7 +45,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # profiling
-profile_enabled = True # Set to True to enable cProfile profiling
+profile_enabled = False # Set to True to enable cProfile profiling
 profile_iterations = -1  # Number of iterations to profile (set to -1 for all)
 profile_output = 'profile_stats.prof'  # Output file for profiling results
 # wandb logging
@@ -482,6 +482,37 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+# Save final checkpoint if we're the master process
+if master_process:
+    checkpoint = {
+        'model': raw_model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'model_args': model_args,
+        'iter_num': iter_num,
+        'best_val_loss': best_val_loss,
+        'config': config,
+    }
+
+    # Save locally first
+    checkpoint_path = os.path.join(out_dir, 'ckpt.pt')
+    print(f"saving final checkpoint to {out_dir}")
+    torch.save(checkpoint, checkpoint_path)
+
+    # Log to W&B as artifact
+    if wandb_log:
+        import wandb
+        artifact = wandb.Artifact(
+            name=f"model-checkpoint",
+            type="model",
+            metadata={
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+            }
+        )
+        artifact.add_file(checkpoint_path)
+        wandb.log_artifact(artifact)
+        print(f"logged checkpoint to wandb as artifact")
 
 # Save profiling results if we were profiling and didn't finish
 if profile_enabled and master_process and profile_iter_count > 0:
