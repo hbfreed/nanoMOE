@@ -26,7 +26,7 @@ out_dir = (
 )
 
 wandb_log = True
-wandb_project = "shakespeare-eval"
+wandb_project = "shakespeare-char"
 wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-{expert_sizes_str}"
 
 # these make the total batch size

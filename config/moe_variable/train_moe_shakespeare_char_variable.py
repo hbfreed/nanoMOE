@@ -26,7 +26,7 @@ expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])
 out_dir = f"out-shakespeare-char/moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
 
 wandb_log = True
-wandb_project = "shakespeare-eval"
+wandb_project = "shakespeare-char"
 wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
 
 # these make the total batch size

@@ -98,6 +98,8 @@ dtype = (
     else "float16"
 )  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True  # use PyTorch 2.0 to compile the model to be faster
+# random seed
+seed = 1337  # random seed for reproducibility
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -133,7 +135,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(seed + seed_offset)
 
 # TODO: When we upgrade to higher pytorch versions, switch to this.
 # torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance

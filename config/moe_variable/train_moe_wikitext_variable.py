@@ -29,7 +29,7 @@ out_dir = (
 )
 
 wandb_log = True
-wandb_project = "moe-wikitext"
+wandb_project = "wikitext"
 wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
 
 # these make the total batch size be 32 * 1024 * 6 = 196,608

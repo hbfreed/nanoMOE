@@ -31,14 +31,13 @@ wandb_project = "gpt2-chinchilla"
 wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
 
 # these make the total batch size be ~0.5M
-# 10 batch size * 1024 block size * 78 gradaccum * 3 GPUs = 2,396,160
-batch_size = 10
+batch_size = 12
 n_ctx = 1024
-gradient_accumulation_steps = 13 * 6
+gradient_accumulation_steps = 13 * 3
 
-# 5217 gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion, so multiplied by 5 we get a little over 20 bil.)
-max_iters = 5217 * 5
-lr_decay_iters = 5217 * 5
+# 3130 gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion)
+max_iters = 5216
+lr_decay_iters = 5216
 
 # eval stuff
 eval_interval = 500

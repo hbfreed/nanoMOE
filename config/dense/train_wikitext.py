@@ -15,7 +15,7 @@ use_moe = False
 out_dir = "out-wikitext/dense"
 
 wandb_log = True
-wandb_project = "moe-wikitext"
+wandb_project = "wikitext"
 wandb_run_name = "dense"
 
 # these make the total batch size be 32 * 1024 * 6 = 196,608

@@ -14,7 +14,7 @@ use_moe = False
 out_dir = "out-shakespeare-char/dense"
 
 wandb_log = True
-wandb_project = "shakespeare-eval"
+wandb_project = "shakespeare-char"
 wandb_run_name = "dense"
 
 # these make the total batch size
