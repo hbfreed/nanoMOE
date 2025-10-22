@@ -1,9 +1,8 @@
-# config for training MoE GPT-2 (124M parameters but with 8 experts)
-# launch as: torchrun --standalone --nproc_per_node=8 train.py config/moe/train_moe_gpt2.py
+# GPT-2 MoE model configuration for OpenWebText training
+# Train to 300B tokens on 1 node of 8X A100 40GB
+# Launch as: torchrun --standalone --nproc_per_node=8 train.py config/moe/train_moe_gpt2.py
 
-wandb_log = True
-wandb_project = "moe-owt"
-wandb_run_name = "moe-gpt2-124M"
+dataset = "openwebtext"
 
 # Model configuration - same base size as GPT-2 124M
 n_layer = 12
@@ -17,12 +16,25 @@ use_moe = True
 num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
-block_size = 128  # Triton kernel block size
-block_k = 128  # Triton kernel K dimension
+block_size = 128
+block_k = 64
+expert_sizes = [(num_experts, n_embd * 4 // num_experts_per_tok)]
+load_balance_loss_weight = 0.01
+
+# Create string representation of expert sizes for naming
+expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])
+
+out_dir = (
+    f"out-openwebtext/moe-{num_experts}x{num_experts_per_tok}-{expert_sizes_str}-300B"
+)
+
+wandb_log = True
+wandb_project = "owt"
+wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-{expert_sizes_str}"
 
 # these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
+# 10 batch size * 1024 block size * 40 gradaccum * 8 GPUs = 3,276,800
+batch_size = 10
 n_ctx = 1024
 gradient_accumulation_steps = 5 * 8
 

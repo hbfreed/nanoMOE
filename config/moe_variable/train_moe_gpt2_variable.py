@@ -1,6 +1,8 @@
 # GPT-2 MoE model configuration for OpenWebText training
-# with VARIABLE-SIZE EXPERTS - Chinchilla-optimal scaling
+# with VARIABLE-SIZE EXPERTS
 # 4 large experts (2944) and 4 small experts (128)
+# Train to 300B tokens on 1 node of 8X A100 40GB
+# Launch as: torchrun --standalone --nproc_per_node=8 train.py config/moe_variable/train_moe_gpt2_variable.py
 
 dataset = "openwebtext"
 
@@ -24,24 +26,24 @@ load_balance_loss_weight = 0.5
 # Create string representation of expert sizes for naming
 expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])
 
-out_dir = f"out-openwebtext/moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
+out_dir = f"out-openwebtext/moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}-300B"
 
 wandb_log = True
-wandb_project = "gpt2-chinchilla"
+wandb_project = "owt"
 wandb_run_name = f"moe-{num_experts}x{num_experts_per_tok}-variable-{expert_sizes_str}"
 
 # these make the total batch size be ~0.5M
-# 10 batch size * 1024 block size * 78 gradaccum * 3 GPUs = 2,396,160
+# 10 batch size * 1024 block size * 40 gradaccum * 8 GPUs = 3,276,800
 batch_size = 10
 n_ctx = 1024
-gradient_accumulation_steps = 13 * 6
+gradient_accumulation_steps = 5 * 8
 
-# 5217 gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion, so multiplied by 5 we get a little over 20 bil.)
-max_iters = 5217 * 5
-lr_decay_iters = 5217 * 5
+# this makes total number of tokens be 300B
+max_iters = 600000
+lr_decay_iters = 600000
 
 # eval stuff
-eval_interval = 500
+eval_interval = 1000
 eval_iters = 200
 log_interval = 10
 

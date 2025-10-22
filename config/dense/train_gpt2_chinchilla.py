@@ -1,15 +1,26 @@
-# config for training GPT-2 (124M) down to very nice loss of ~2.85 on 1 node of 8X A100 40GB
-# launch as the following (e.g. in a screen session) and wait ~5 days:
-# $ torchrun --standalone --nproc_per_node=8 train.py config/dense/train_gpt2_chinchilla.py
+# GPT-2 dense model configuration for OpenWebText training
+# Chinchilla-optimal scaling
 
-out_dir = "out-chinchilla/dense-baseline"
+dataset = "openwebtext"
+
+# Model configuration - same base size as GPT-2 124M
+n_layer = 12
+n_head = 12
+n_embd = 768
+dropout = 0.0
+bias = False
+
+# MoE configuration (disabled for dense)
+use_moe = False
+
+out_dir = "out-openwebtext/dense"
 
 wandb_log = True
 wandb_project = "gpt2-chinchilla"
-wandb_run_name = "dense-baseline"
+wandb_run_name = "dense"
 
 # these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size *13 gradaccum * 3 GPUs = 479,232
+# 12 batch size * 1024 block size * 39 gradaccum * 3 GPUs = 1,445,888
 batch_size = 12
 n_ctx = 1024
 gradient_accumulation_steps = 13 * 3
@@ -26,5 +37,6 @@ log_interval = 10
 # weight decay
 weight_decay = 1e-1
 
-# MoE configuration (disabled for standard GPT-2)
-use_moe = False
+# learning rate
+learning_rate = 6e-4
+min_lr = 6e-5
