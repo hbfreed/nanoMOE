@@ -127,7 +127,7 @@ class MLP(nn.Module):
         return x
 
 
-class MoeMLPMegaBlocks(nn.Module):
+class MoeMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
@@ -170,8 +170,6 @@ class MoeMLPMegaBlocks(nn.Module):
             self.expert_offsets.append(self.expert_offsets[-1] + size)
         self.total_expert_width = self.expert_offsets[-1]
 
-        # For backward compatibility, set d_ffn to the first expert's size
-        # (used in some calculations that assume uniform sizing)
         self.d_ffn = self.expert_sizes[0]
 
         # Register buffers for efficient CUDA kernel access
@@ -192,16 +190,16 @@ class MoeMLPMegaBlocks(nn.Module):
 
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
 
-        # Allocate weights with variable width (total_expert_width instead of num_experts * d_ffn)
         self.w1 = nn.Parameter(torch.empty(self.n_embd, self.total_expert_width))
         self.w2 = nn.Parameter(torch.empty(self.total_expert_width, self.n_embd))
 
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02, a=-0.06, b=0.06)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=0.02, a=-0.06, b=0.06)
-
+        
+        # need these bits for the megablocks ops
         self.sort_end_bit = max(
             int(np.ceil(np.log2(self.num_experts))), 1
-        )  # need these bits for the megablocks ops
+        )  
 
         # Use total_expert_width for max_column_index calculation
         max_column_index = self.total_expert_width // self.block_size
@@ -214,25 +212,21 @@ class MoeMLPMegaBlocks(nn.Module):
 
         x_flat = rearrange(
             x, "batch_size seq_len n_embd -> (batch_size seq_len) n_embd"
-        )  # [batch*seq, n_embd]
+        )
 
         router_logits = self.router(x_flat)
 
-        # FIX: Apply softmax BEFORE topk to match STK behavior
         router_probs = F.softmax(
-            router_logits, dim=-1, dtype=torch.float
+            router_logits, dim=-1, dtype=torch.float32
         )  # Use float32 for stability
 
-        # Select top-k experts based on probabilities
         expert_weights, selected_experts = torch.topk(
             router_probs, self.num_experts_per_tok, dim=-1
         )
 
-        # Normalize the top-k weights to sum to 1
         if self.norm_topk_prob:
             expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
 
-        # Convert back to model dtype
         expert_weights = expert_weights.to(x.dtype)
 
         expert_weights_flat = rearrange(expert_weights, "... -> (...)")
@@ -274,8 +268,11 @@ class MoeMLPMegaBlocks(nn.Module):
             torch.logsumexp(router_logits, dim=-1).pow(2).mean()
         )  # router z-loss keeps router logits small
 
-        p_i = F.softmax(router_logits, dim=-1)  # Shape: (batch*seq, num_experts)
-        p_i = p_i.mean(dim=0)  # Average probability per expert: (num_experts,)
+        p_i = router_probs.mean(
+            dim=0
+        ).to(
+            x.dtype
+        )
 
         experts_flat = selected_experts.flatten()
         f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
@@ -303,8 +300,7 @@ class MoeMLPMegaBlocks(nn.Module):
         padded_bins = ops.inclusive_cumsum(padded_tokens_per_expert, 0)
         padded_bins = padded_bins.contiguous()
 
-        padded_tokens = padded_bins[-1]
-        padded_tokens = max(padded_tokens, self.block_size)  # Ensure minimum size
+        padded_tokens = padded_bins[-1].clamp_min(self.block_size)
 
         block_rows = padded_tokens // self.block_size
 
@@ -318,12 +314,8 @@ class MoeMLPMegaBlocks(nn.Module):
         )
 
         # Compute all expert token blocks at once
-        bin_sizes = torch.diff(
-            padded_bins,
-            prepend=torch.tensor(
-                [0], device=padded_bins.device, dtype=padded_bins.dtype
-            ),
-        )
+        prepend = padded_bins.new_zeros(1)
+        bin_sizes = torch.diff(padded_bins, prepend=prepend)
         expert_token_blocks = bin_sizes // self.block_size
 
         # Repeat each expert's size by how many token blocks it handles
@@ -332,14 +324,7 @@ class MoeMLPMegaBlocks(nn.Module):
         )
 
         # Cumulative sum gives you offsets
-        offsets = torch.cat(
-            [
-                torch.tensor(
-                    [0], device=repeated_sizes.device, dtype=repeated_sizes.dtype
-                ),
-                repeated_sizes.cumsum(0),
-            ]
-        )
+        offsets = torch.cat([repeated_sizes.new_zeros(1), repeated_sizes.cumsum(0)])
 
         column_indices = column_indices.to(torch.int32)
         offsets = offsets.to(torch.int32)
@@ -679,7 +664,8 @@ class GPT(nn.Module):
 
         combined_aux_loss = None
         aux_loss_count = 0
-        all_expert_usage = []  # Collect expert usage from all layers
+        expert_usage_sum = None
+        expert_usage_count = 0  # Track number of MoE layers contributing usage stats
 
         for block in self.transformer.h:
             block_out = block(x)
@@ -688,7 +674,11 @@ class GPT(nn.Module):
             if len(block_out) == 3:
                 x, aux_loss, f_i = block_out
                 if f_i is not None:
-                    all_expert_usage.append(f_i)
+                    if expert_usage_sum is None:
+                        expert_usage_sum = f_i.clone()
+                    else:
+                        expert_usage_sum += f_i
+                    expert_usage_count += 1
             else:
                 x, aux_loss = block_out
 
@@ -707,8 +697,10 @@ class GPT(nn.Module):
                 )
 
         # Average expert usage across layers
-        if all_expert_usage:
-            avg_expert_usage = torch.stack(all_expert_usage).mean(dim=0)
+        if expert_usage_sum is not None and expert_usage_count > 0:
+            avg_expert_usage = expert_usage_sum / expert_usage_count
+            if combined_aux_loss is None:
+                combined_aux_loss = {}
             combined_aux_loss["expert_usage"] = avg_expert_usage
 
         x = self.transformer.ln_f(x)

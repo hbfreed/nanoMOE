@@ -35,7 +35,7 @@ batch_size = 12
 n_ctx = 1024
 gradient_accumulation_steps = 13 * 3
 
-# 3130 gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion)
+# gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion)
 max_iters = 5216
 lr_decay_iters = 5216
 
