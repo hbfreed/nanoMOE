@@ -424,8 +424,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if config.use_moe:
-            # self.mlp = MoeMLPSTK(config)
-            self.mlp = MoeMLPMegaBlocks(config)
+            self.mlp = MoeMLP(config)
         else:
             self.mlp = MLP(config)
 

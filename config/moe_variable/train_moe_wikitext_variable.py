@@ -19,7 +19,7 @@ norm_topk_prob = True
 block_size = 128
 block_k = 32
 expert_sizes = [(4, 2432), (4, 128)]  # 4 large (2432) + 4 small (128)
-load_balance_loss_weight = 0.5
+load_balance_loss_weight = 0.4
 
 # Create string representation of expert sizes for naming
 expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])
