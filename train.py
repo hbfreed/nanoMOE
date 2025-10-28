@@ -479,6 +479,14 @@ while True:
                             f"WARNING: Expert collapse detected! Expert {max_idx} has {max_usage:.1%} of tokens"
                         )
 
+                # Log per-layer expert usage
+                if "expert_usage_per_layer" in combined_aux_loss:
+                    expert_usage_per_layer = combined_aux_loss["expert_usage_per_layer"]
+                    for layer_idx, layer_usage in enumerate(expert_usage_per_layer):
+                        layer_usage_list = layer_usage.tolist()
+                        for expert_idx, usage in enumerate(layer_usage_list):
+                            log_dict[f"layer_{layer_idx}/expert_{expert_idx}"] = usage
+
             wandb.log(log_dict)
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]

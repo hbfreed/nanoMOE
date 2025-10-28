@@ -665,6 +665,7 @@ class GPT(nn.Module):
         aux_loss_count = 0
         expert_usage_sum = None
         expert_usage_count = 0  # Track number of MoE layers contributing usage stats
+        expert_usage_per_layer = []  # Store per-layer expert usage
 
         for block in self.transformer.h:
             block_out = block(x)
@@ -678,6 +679,8 @@ class GPT(nn.Module):
                     else:
                         expert_usage_sum += f_i
                     expert_usage_count += 1
+                    # Store per-layer expert usage
+                    expert_usage_per_layer.append(f_i.clone())
             else:
                 x, aux_loss = block_out
 
@@ -701,6 +704,7 @@ class GPT(nn.Module):
             if combined_aux_loss is None:
                 combined_aux_loss = {}
             combined_aux_loss["expert_usage"] = avg_expert_usage
+            combined_aux_loss["expert_usage_per_layer"] = expert_usage_per_layer
 
         x = self.transformer.ln_f(x)
 
@@ -927,3 +931,139 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+"""
+MoeMLPWithTracking and GPTWithTracking are the same as MoeMLP and GPT, but with extra tracking of expert assignments and router logits.
+"""
+
+class MoeMLPWithTracking(MoeMLP):
+    """Add expert assignment tracking to the mlp layer's forward pass"""
+
+    @torch.compiler.disable
+    def forward(self, x):
+        batch_size, seq_len, n_embd = x.shape
+
+        x_flat = rearrange(x, 'batch_size seq_len n_embd -> (batch_size seq_len) n_embd')
+
+        router_logits = self.router(x_flat)
+        router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+        expert_weights, selected_experts = torch.topk(router_probs, self.num_experts_per_tok, dim=-1)
+
+        if self.norm_topk_prob:
+            expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+        expert_weights = expert_weights.to(x.dtype)
+        expert_weights_flat = rearrange(expert_weights, '... -> (...)')
+        selected_experts_flat = rearrange(selected_experts, '... -> (...)')
+
+        bin_ids, indices, tokens_per_expert = self._sort_tokens_by_expert(selected_experts_flat)
+        padded_bins, topology = self._create_topology(x_flat, tokens_per_expert)
+        x_permuted = self._gather_tokens(x_flat, indices, bin_ids, tokens_per_expert, padded_bins)
+        x_permuted = stk.ops.sdd(x_permuted, self.w1, topology)
+        x_permuted = gelu(x_permuted)
+        x_permuted = stk.ops.dsd(x_permuted, self.w2)
+
+        x_permuted = self._scatter_tokens(x_permuted, indices, bin_ids, expert_weights_flat, tokens_per_expert, padded_bins)
+        output = rearrange(x_permuted, '(batch_size seq_len) n_embd -> batch_size seq_len n_embd', batch_size=batch_size, seq_len=seq_len)
+
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
+
+        p_i = router_probs.mean(dim=0).to(torch.bfloat16)
+
+        experts_flat = selected_experts.flatten()
+        f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
+        ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
+        f_i.scatter_add(0, experts_flat, ones)
+        load_balance_loss = self.num_experts * (f_i @ p_i)
+        
+        expert_assignments = rearrange(selected_experts, '(batch seq) k -> batch seq k', batch=batch_size, seq=seq_len)
+        router_logits_reshaped = rearrange(router_logits, '(batch seq) num_experts -> batch seq num_experts', batch=batch_size, seq=seq_len)
+        router_probs_reshaped = rearrange(router_probs, '(batch seq) num_experts -> batch seq num_experts', batch=batch_size, seq=seq_len)
+
+        aux_loss = {
+            'router_z_loss': router_z_loss,
+            'load_balance_loss': load_balance_loss,
+            'expert_assignments': expert_assignments,
+            'router_logits': router_logits_reshaped,
+            'router_probs': router_probs_reshaped,
+        }
+        
+        return output, aux_loss, f_i
+
+class GPTWithTracking(GPT):
+    """Track expert assignments across layers"""
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.n_ctx, f"Cannot forward sequence of length {t}, context length is only {self.config.n_ctx}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        combined_aux_loss = {}
+        all_expert_usage = []
+        all_expert_assignments = {}
+        all_router_logits = {}
+        all_router_probs = {}
+        all_layer_entropies = {}
+        aux_loss_count = 0
+
+        for layer_idx, block in enumerate(self.transformer.h):
+            block_out = block(x)
+            
+            x, aux_loss, f_i = block_out
+            
+            # Compute intermediate entropy after this layer
+            # Apply layer norm and project to vocab to get intermediate predictions
+            x_normed = self.transformer.ln_f(x)
+            intermediate_logits = self.lm_head(x_normed)
+            intermediate_probs = F.softmax(intermediate_logits, dim=-1, dtype=torch.float32)
+            epsilon = 1e-10
+            layer_entropy = -(intermediate_probs * torch.log(intermediate_probs + epsilon)).sum(dim=-1)
+            
+            if f_i is not None:
+                all_expert_usage.append(f_i)
+            
+            all_expert_assignments[f'layer_{layer_idx}'] = aux_loss['expert_assignments']
+            all_router_logits[f'layer_{layer_idx}'] = aux_loss['router_logits']
+            all_router_probs[f'layer_{layer_idx}'] = aux_loss['router_probs']
+            all_layer_entropies[f'layer_{layer_idx}'] = layer_entropy
+            
+            if layer_idx == 0:
+                combined_aux_loss = {k: v.clone() for k, v in aux_loss.items() 
+                                if k not in ['expert_assignments', 'router_logits', 'router_probs']}
+            else:
+                for key in aux_loss:
+                    if key not in ['expert_assignments', 'router_logits', 'router_probs']:
+                        combined_aux_loss[key] += aux_loss[key]
+            
+            aux_loss_count += 1
+
+        for key in combined_aux_loss:
+            combined_aux_loss[key] /= aux_loss_count
+
+        if all_expert_usage:
+            avg_expert_usage = torch.stack(all_expert_usage).mean(dim=0)
+            combined_aux_loss['expert_usage'] = avg_expert_usage
+
+        combined_aux_loss['expert_assignments'] = all_expert_assignments
+        combined_aux_loss['router_logits'] = all_router_logits
+        combined_aux_loss['router_probs'] = all_router_probs
+        combined_aux_loss['layer_entropies'] = all_layer_entropies
+
+        x = self.transformer.ln_f(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = ce_loss
+            if combined_aux_loss is not None:
+                loss = loss + self.config.load_balance_loss_weight * combined_aux_loss['load_balance_loss'] + self.config.router_z_loss_weight * combined_aux_loss['router_z_loss']
+                combined_aux_loss['ce_loss'] = ce_loss
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+            ce_loss = None
+
+        return logits, loss, combined_aux_loss
