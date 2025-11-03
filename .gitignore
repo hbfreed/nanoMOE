@@ -20,3 +20,5 @@ logs/
 *.csv
 *build/
 *.so
+out-lbl-w*/
+out-flops-loss-w*/

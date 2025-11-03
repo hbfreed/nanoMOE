@@ -74,6 +74,7 @@ expert_sizes = None  # list of (count, size) tuples for variable expert sizes, e
 router_aux_loss_coef = 0.01  # auxiliary loss coefficient for load balancing
 load_balance_loss_weight = 0.02  # weight for load balance auxiliary loss
 router_z_loss_weight = 0.001  # weight for router z-loss auxiliary loss
+compute_loss_weight = 0.0  # weight for compute-based auxiliary loss (minimizes compute by biasing toward smaller experts)
 # adamw optimizer
 learning_rate = 6e-4  # max learning rate
 max_iters = 600000  # total number of training iterations
@@ -220,6 +221,7 @@ if "use_moe" in globals():
         model_args["expert_sizes"] = expert_sizes
         model_args["load_balance_loss_weight"] = load_balance_loss_weight
         model_args["router_z_loss_weight"] = router_z_loss_weight
+        model_args["compute_loss_weight"] = compute_loss_weight
         print(
             f"MoE enabled with {num_experts} experts, {num_experts_per_tok} experts per token"
         )
@@ -309,6 +311,7 @@ def estimate_loss():
         ce_losses = torch.zeros(eval_iters)
         load_balance_losses = torch.zeros(eval_iters)
         router_z_losses = torch.zeros(eval_iters)
+        compute_losses = torch.zeros(eval_iters)
 
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -321,18 +324,32 @@ def estimate_loss():
                     aux_losses["load_balance_loss"],
                     aux_losses["router_z_loss"],
                 ]
-                if "ce_loss" in aux_losses:
+                has_flops = "compute_loss" in aux_losses
+                has_ce = "ce_loss" in aux_losses
+
+                if has_flops:
+                    items_to_extract.append(aux_losses["compute_loss"])
+                if has_ce:
                     items_to_extract.append(aux_losses["ce_loss"])
-                    extracted = [t.item() for t in items_to_extract]
-                    (
-                        losses[k],
-                        load_balance_losses[k],
-                        router_z_losses[k],
-                        ce_losses[k],
-                    ) = extracted
+
+                extracted = [t.item() for t in items_to_extract]
+
+                # Unpack based on what we have
+                idx = 0
+                losses[k] = extracted[idx]
+                idx += 1
+                load_balance_losses[k] = extracted[idx]
+                idx += 1
+                router_z_losses[k] = extracted[idx]
+                idx += 1
+
+                if has_flops:
+                    compute_losses[k] = extracted[idx]
+                    idx += 1
+
+                if has_ce:
+                    ce_losses[k] = extracted[idx]
                 else:
-                    extracted = [t.item() for t in items_to_extract]
-                    losses[k], load_balance_losses[k], router_z_losses[k] = extracted
                     ce_losses[k] = losses[k]  # For dense models, total loss is CE loss
             else:
                 loss_val = loss.item()
@@ -343,6 +360,7 @@ def estimate_loss():
         out[f"{split}_ce"] = ce_losses.mean()
         out[f"{split}_load_balance"] = load_balance_losses.mean()
         out[f"{split}_router_z"] = router_z_losses.mean()
+        out[f"{split}_flops"] = compute_losses.mean()
 
     model.train()
     return out
@@ -450,6 +468,10 @@ while True:
                 log_dict["train/router_z_loss"] = losses["train_router_z"]
                 log_dict["val/router_z_loss"] = losses["val_router_z"]
 
+            if "train_flops" in losses:
+                log_dict["train/compute_loss"] = losses["train_flops"]
+                log_dict["val/compute_loss"] = losses["val_flops"]
+
             # Log step-level auxiliary losses if available
             if combined_aux_loss is not None:
                 # Batch extract auxiliary losses
@@ -457,9 +479,15 @@ while True:
                     combined_aux_loss["load_balance_loss"],
                     combined_aux_loss["router_z_loss"],
                 ]
+                if "compute_loss" in combined_aux_loss:
+                    aux_items.append(combined_aux_loss["compute_loss"])
+
                 aux_extracted = [t.item() for t in aux_items]
                 log_dict["train/load_balance_loss_step"] = aux_extracted[0]
                 log_dict["train/router_z_loss_step"] = aux_extracted[1]
+
+                if "compute_loss" in combined_aux_loss:
+                    log_dict["train/compute_loss_step"] = aux_extracted[2]
 
                 if "expert_usage" in combined_aux_loss:
                     expert_usage = combined_aux_loss["expert_usage"]
