@@ -1,19 +1,18 @@
 #!/bin/bash
 
-# Train 23:1 ratio (2944:128) with multiple seeds
 # Testing consistency of routing patterns across different initializations
 # Using LBL=0.01 and compute=0.004
 
-PROJECT="gpt2-multiseed-23to1"
+PROJECT="gpt2-multiseed-5to1"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-EXPERIMENT_DIR="gpt2_experiments/multiseed_23to1_${TIMESTAMP}"
+EXPERIMENT_DIR="gpt2_experiments/multiseed_5to1_${TIMESTAMP}"
 
 # Create experiment directory
 mkdir -p "$EXPERIMENT_DIR/logs"
 
 # Fixed configuration
-LARGE_SIZE=2944
-SMALL_SIZE=128
+LARGE_SIZE=2560
+SMALL_SIZE=640
 LBL_WEIGHT=0.01
 COMPUTE_WEIGHT=0.004
 
@@ -21,7 +20,7 @@ COMPUTE_WEIGHT=0.004
 SEEDS=(42 1223)
 
 echo "========================================="
-echo "Multi-seed training for 23:1 ratio"
+echo "Multi-seed training for 5:1 ratio"
 echo "Project: $PROJECT"
 echo "Timestamp: $TIMESTAMP"
 echo "Large experts: 4 × $LARGE_SIZE"
@@ -33,7 +32,7 @@ echo "========================================="
 echo ""
 
 for seed in "${SEEDS[@]}"; do
-    RUN_NAME="ratio23_lbl${LBL_WEIGHT}_compute${COMPUTE_WEIGHT}_seed${seed}_${TIMESTAMP}"
+    RUN_NAME="ratio5_lbl${LBL_WEIGHT}_compute${COMPUTE_WEIGHT}_seed${seed}_${TIMESTAMP}"
 
     echo "========================================="
     echo "Training with seed=$seed"
