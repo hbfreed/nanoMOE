@@ -11,16 +11,18 @@ EXPERIMENT_DIR="gpt2_experiments/multiseed_5to1_${TIMESTAMP}"
 mkdir -p "$EXPERIMENT_DIR/logs"
 
 # Fixed configuration
-LARGE_SIZE=2560
+#LARGE_SIZE=2560
 SMALL_SIZE=640
 LBL_WEIGHT=0.01
 COMPUTE_WEIGHT=0.004
 
 # Seeds to test
-SEEDS=(42 1223)
+# SEEDS=(42 1223)
+#SMALLS=(640 768 512)
+BIGS=(3072)
 
 echo "========================================="
-echo "Multi-seed training for 5:1 ratio"
+echo "Multi-seed training for 5:1 (ish) ratio"
 echo "Project: $PROJECT"
 echo "Timestamp: $TIMESTAMP"
 echo "Large experts: 4 × $LARGE_SIZE"
@@ -31,8 +33,8 @@ echo "Seeds: ${SEEDS[@]}"
 echo "========================================="
 echo ""
 
-for seed in "${SEEDS[@]}"; do
-    RUN_NAME="ratio5_lbl${LBL_WEIGHT}_compute${COMPUTE_WEIGHT}_seed${seed}_${TIMESTAMP}"
+for big in "${BIGS[@]}"; do
+    RUN_NAME="ratio5_lbl${LBL_WEIGHT}_compute${COMPUTE_WEIGHT}_${SMALL_SIZE}x${big}_seed1337_${TIMESTAMP}"
 
     echo "========================================="
     echo "Training with seed=$seed"
@@ -44,8 +46,8 @@ for seed in "${SEEDS[@]}"; do
         --wandb_run_name="$RUN_NAME" \
         --load_balance_loss_weight=$LBL_WEIGHT \
         --compute_loss_weight=$COMPUTE_WEIGHT \
-        --seed=$seed \
-        --expert_sizes="[(4, $LARGE_SIZE), (4, $SMALL_SIZE)]" \
+        --seed=1337 \
+        --expert_sizes="[(4, $big), (4, $SMALL_SIZE)]" \
         --out_dir="${EXPERIMENT_DIR}/${RUN_NAME}" \
         2>&1 | tee "${EXPERIMENT_DIR}/logs/${RUN_NAME}.log"
 
@@ -58,5 +60,5 @@ for seed in "${SEEDS[@]}"; do
 done
 
 echo "All multi-seed training runs completed!"
-echo "Total runs: ${#SEEDS[@]}"
+echo "Total runs: ${#BIGS[@]}"
 echo "Check wandb project: $PROJECT"
