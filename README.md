@@ -111,7 +111,17 @@ Because the code is so simple, it is very easy to hack to your needs, train new 
 ## install
 
 ```
-pip install torch numpy transformers datasets tiktoken wandb tqdm
+pip install torch numpy transformers datasets tiktoken wandb tqdm einops tokenizers
+```
+
+### Variable-size MoE support
+
+To install support for variable-size MoEs, use the custom megablocks fork:
+
+```sh
+git clone https://github.com/hbfreed/megablocks-variable
+cd megablocks-variable
+pip install -e .[all]
 ```
 
 Dependencies:
