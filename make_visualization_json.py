@@ -11,9 +11,7 @@ from tqdm import tqdm
 
 from model import GPTConfig, GPTWithTracking, MoeMLPWithTracking
 
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision("high")  # Or 'medium' for even more speed
+torch.backends.cuda.matmul.fp32_precision = 'tf32'
 
 config = GPTConfig(
     n_layer=12,
@@ -26,14 +24,13 @@ config = GPTConfig(
     num_experts_per_tok=2,
     norm_topk_prob=True,
     block_size=128,
-    block_k=64,
     # expert_sizes=[(4, 2560), (4, 512)],  # 5:1
     expert_sizes=[(4, 2944), (4, 128)],  # 23:1
 )
 
 checkpoint_path = (
-    "gpt2_experiments/multiseed_23to1/ratio23_lbl0.01_compute0.004_seed1223/ckpt.pt"
-    # "gpt2_experiments/multiseed_5to1/ratio5_lbl0.01_compute0.004_seed1223/ckpt.pt"
+    "gpt2_experiments/multiseed_23to1/ratio23_lbl0.08_compute0.004_seed42/ckpt.pt"
+    # "gpt2_experiments/multiseed_5to1/ratio5_lbl0.08_compute0.004_seed42/ckpt.pt"
 )
 
 model = GPTWithTracking(config).to(torch.bfloat16)
@@ -127,14 +124,14 @@ for batch_idx in tqdm(range(num_batches)):
     )
 
 # sizing_map = {
-#     0: 2560,
-#     1: 2560,
-#     2: 2560,
-#     3: 2560,
-#     4: 512,
-#     5: 512,
-#     6: 512,
-#     7: 512,
+#    0: 2560,
+#    1: 2560,
+#    2: 2560,
+#    3: 2560,
+#    4: 512,
+#    5: 512,
+#    6: 512,
+#    7: 512,
 # }  # for 5:1
 sizing_map = {
     0: 2944,
@@ -146,7 +143,77 @@ sizing_map = {
     6: 128,
     7: 128,
 }  # for 23:1
-#
+
+# Pre-process tokens to identify byte sequences that form characters
+def find_byte_token_groups(tokens, tokenizer):
+    """Find groups of consecutive byte tokens that form single characters."""
+    REPLACEMENT_CHAR = "\ufffd"
+    groups = {}  # maps token_idx -> {"char": "'", "position": 1, "total": N}
+
+    i = 0
+    while i < len(tokens):
+        decoded = tokenizer.decode([tokens[i]])
+
+        # Case 1: Token is exactly a replacement char
+        if decoded == REPLACEMENT_CHAR:
+            group_start = i
+            group_tokens = [tokens[i]]
+            i += 1
+
+            # Keep collecting while we get replacement chars
+            while i < len(tokens):
+                next_decoded = tokenizer.decode([tokens[i]])
+                if next_decoded == REPLACEMENT_CHAR:
+                    group_tokens.append(tokens[i])
+                    i += 1
+                else:
+                    break
+
+            # Try to decode the group together
+            combined = tokenizer.decode(group_tokens)
+            if combined != REPLACEMENT_CHAR * len(group_tokens):
+                for pos, idx in enumerate(range(group_start, group_start + len(group_tokens))):
+                    groups[idx] = {
+                        "char": combined,
+                        "position": pos + 1,
+                        "total": len(group_tokens)
+                    }
+
+        # Case 2: Token ends with replacement char (e.g., " �" for opening quotes)
+        elif decoded.endswith(REPLACEMENT_CHAR) and len(decoded) > 1:
+            prefix = decoded[:-1]  # The non-replacement part (e.g., " ")
+            group_start = i
+            group_tokens = [tokens[i]]
+            i += 1
+
+            # Keep collecting while we get replacement chars
+            while i < len(tokens):
+                next_decoded = tokenizer.decode([tokens[i]])
+                if next_decoded == REPLACEMENT_CHAR:
+                    group_tokens.append(tokens[i])
+                    i += 1
+                else:
+                    break
+
+            # Try to decode the group together
+            combined = tokenizer.decode(group_tokens)
+            # Extract just the special character (remove the prefix)
+            if combined.startswith(prefix):
+                special_char = combined[len(prefix):]
+                if special_char and special_char != REPLACEMENT_CHAR * (len(group_tokens)):
+                    for pos, idx in enumerate(range(group_start, group_start + len(group_tokens))):
+                        groups[idx] = {
+                            "char": special_char,
+                            "position": pos + 1,
+                            "total": len(group_tokens)
+                        }
+        else:
+            i += 1
+
+    return groups
+
+byte_token_groups = find_byte_token_groups(tokenized_texts, tokenizer)
+
 token_data = {"text": eval_texts, "tokens": []}
 for token_idx, token in enumerate(tokenized_texts):
     layers_list = []
@@ -167,12 +234,18 @@ for token_idx, token in enumerate(tokenized_texts):
 
     intermediate_dict = {
         "token": tokenizer.decode([token]),
+        "token_id": int(token),
         "position": token_idx,
         "mean_expert_size": round(total_expert_size / config.n_layer, 2),
         "layers": layers_list,
     }
+
+    # Add byte token annotation if this is part of a multi-byte character
+    if token_idx in byte_token_groups:
+        intermediate_dict["part_of"] = byte_token_groups[token_idx]
+
     token_data["tokens"].append(intermediate_dict)
 
 with open("routing_data_23to1.json", "w") as f:
-    # with open("routing_data_5to1.json", "w") as f:
+# with open("routing_data_5to1.json", "w") as f:
     json.dump(token_data, f, indent=2)

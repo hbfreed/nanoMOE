@@ -17,9 +17,9 @@ num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
 block_size = 128
-block_k = 64
 expert_sizes = [(4, 2944), (4, 128)]  # 4 large (2944) + 4 small (128)
-load_balance_loss_weight = 0.5
+load_balance_loss_weight = 0.08
+compute_loss_weight = 0.004
 
 # Create string representation of expert sizes for naming
 expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])
@@ -36,8 +36,8 @@ n_ctx = 1024
 gradient_accumulation_steps = 13 * 3
 
 # gets us to roughly 2.5 billion tokens, which is chinchilla optimal for a model of this size (125m * 20 = 2.5 billion)
-max_iters = 5216
-lr_decay_iters = 5216
+max_iters = 5217
+lr_decay_iters = 5217
 
 # eval stuff
 eval_interval = 500

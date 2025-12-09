@@ -22,3 +22,7 @@ logs/
 *.so
 out-lbl-w*/
 out-flops-loss-w*/
+domain_analysis.py
+variable_expert_analysis.py
+make_visualization_json.py
+moe.py

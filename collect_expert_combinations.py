@@ -374,9 +374,7 @@ def print_summary(df, config):
 def run_single_seed(dataset, expert_config, seed, device, output_dir):
     """Run analysis for a single seed."""
     # Setup
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
 
     # Get configuration
     print(f"\n{'='*60}")

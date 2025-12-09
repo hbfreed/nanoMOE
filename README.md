@@ -16,12 +16,35 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
 Almost all of the architectural decisions are based off of the OLMoE paper.
 
 ### Routing Strategy
-- **Router Type**: Top-k routing 
+- **Router Type**: Top-k routing
 - **Router Architecture**: Single linear layer per MoE block
 - **Normalization**: Layer norm before router (following OLMoE's approach)
-- **Auxiliary losses**: 
-  - Load balancing loss (coefficient ~0.01)
-  - Router z-loss for stability (coefficient ~0.001)
+
+### MoE Configuration
+
+The MoE layer is configured via the following parameters:
+
+```python
+# Basic MoE settings
+use_moe = True
+num_experts = 8              # total number of experts
+num_experts_per_tok = 2      # experts activated per token (top-k)
+norm_topk_prob = True        # normalize routing probabilities
+
+# Expert sizes - list of (count, hidden_dim) tuples
+expert_sizes = [(8, 1536)]                    # 8 uniform experts with hidden_dim 1536
+expert_sizes = [(4, 2944), (4, 128)]          # 4 large + 4 small (variable-size)
+
+# Auxiliary losses
+load_balance_loss_weight = 0.01   # encourages uniform expert utilization
+compute_loss_weight = 0.0         # penalizes routing to larger experts (for variable-size)
+```
+
+**Expert Sizes**: The `expert_sizes` parameter specifies expert configurations as a list of `(count, hidden_dim)` tuples. For uniform experts, use a single tuple like `[(8, 1536)]`. For variable-size experts, specify multiple tuples like `[(4, 2944), (4, 128)]` to create 4 large experts and 4 small experts.
+
+**Load Balance Loss**: Encourages the router to distribute tokens evenly across experts. Without this, the model tends to collapse to using only a few experts. Typical values: 0.01 for uniform experts, 0.08 for variable-size experts.
+
+**Compute Loss**: Penalizes routing to larger experts, encouraging the model to use smaller experts when possible. Only useful for variable-size expert configurations. Set to 0.0 for uniform experts, ~0.004 for variable-size.
 
 ### Efficient Batching Strategy
 - **Grouped dispatch**: [MegaBlocks](https://arxiv.org/pdf/2211.15841)-style computation of experts, avoiding loops over experts

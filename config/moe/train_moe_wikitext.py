@@ -15,9 +15,9 @@ num_experts = 8
 num_experts_per_tok = 2
 norm_topk_prob = True
 block_size = 128
-block_k = 32
 expert_sizes = [(num_experts, n_embd * 4 // num_experts_per_tok)]
 load_balance_loss_weight = 0.01
+compute_loss_weight = 0.0
 
 # Create string representation of expert sizes for naming
 expert_sizes_str = "-".join([f"{h}x{d}" for h, d in expert_sizes])

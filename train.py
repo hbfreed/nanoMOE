@@ -69,9 +69,7 @@ num_experts = 8  # number of experts in MoE layer
 num_experts_per_tok = 2  # number of experts to route to per token
 norm_topk_prob = True  # normalize the top-k probabilities to sum to 1
 block_size = 128  # Triton kernel tile size for MoE
-block_k = 64  # Triton kernel K dimension for MoE
 expert_sizes = None  # list of (count, size) tuples for variable expert sizes, e.g., [(32, 128), (32, 512)]
-router_aux_loss_coef = 0.01  # auxiliary loss coefficient for load balancing
 load_balance_loss_weight = 0.02  # weight for load balance auxiliary loss
 router_z_loss_weight = 0.001  # weight for router z-loss auxiliary loss
 compute_loss_weight = 0.0  # weight for compute-based auxiliary loss (minimizes compute by biasing toward smaller experts)
@@ -138,11 +136,7 @@ if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(seed + seed_offset)
 
-# TODO: When we upgrade to higher pytorch versions, switch to this.
-# torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance
-# torch.backends.cudnn.conv.fp32_precision = 'tf32' # Use TF32 for cudnn operations
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+torch.backends.cuda.matmul.fp32_precision = 'tf32'
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {
@@ -217,7 +211,6 @@ if "use_moe" in globals():
         model_args["num_experts_per_tok"] = num_experts_per_tok
         model_args["norm_topk_prob"] = norm_topk_prob
         model_args["block_size"] = block_size
-        model_args["block_k"] = block_k
         model_args["expert_sizes"] = expert_sizes
         model_args["load_balance_loss_weight"] = load_balance_loss_weight
         model_args["router_z_loss_weight"] = router_z_loss_weight

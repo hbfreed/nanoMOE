@@ -23,8 +23,7 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.fp32_precision = 'tf32' # Use TF32 for better performance
-torch.backends.cudnn.conv.fp32_precision = 'tf32' # Use TF32 for cudnn operations
+torch.backends.cuda.matmul.fp32_precision = 'tf32'
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)

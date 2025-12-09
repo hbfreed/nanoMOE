@@ -7,23 +7,21 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math
 import inspect
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import torch._dynamo
-from einops import rearrange
 import stk
 import stk.ops
-import stk.random
-import stk.matrix
+import torch
+import torch.nn as nn
+from einops import rearrange
 from megablocks import ops
 from megablocks.layers.gelu import gelu
+from torch.nn import functional as F
+
 from topology_var import topology_var
 
 
@@ -130,6 +128,7 @@ class MLP(nn.Module):
 class MoeMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.n_embd = config.n_embd
@@ -276,13 +275,13 @@ class MoeMLP(nn.Module):
             torch.logsumexp(router_logits, dim=-1).pow(2).mean()
         )  # router z-loss keeps router logits small
 
-        p_i = router_probs.mean(dim=0).to(x.dtype)
-
         experts_flat = selected_experts.flatten()
         f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
         ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
         f_i.scatter_add_(0, experts_flat, ones)
-        load_balance_loss = self.num_experts * (f_i @ p_i)
+        load_balance_loss = self._compute_load_balance_loss(
+            router_probs, selected_experts_flat, f_i
+        )
 
         router_probs_flat = rearrange(
             router_probs,
@@ -424,31 +423,9 @@ class MoeMLP(nn.Module):
             x, indices, bin_ids, weights, bins, padded_bins, self.num_experts_per_tok
         )
 
-    def _get_topo_tensors(self, topology):
-        """Extract the tensor components from STK Matrix for reconstruction."""
-        return (
-            topology.row_indices,
-            topology.column_indices,
-            topology.offsets,
-            topology.column_indices_t,
-            topology.offsets_t,
-            topology.block_offsets_t,
-        )
-
-    def _compute_load_balance_loss(
-        self, router_probs, selected_experts, batch_size, seq_len
-    ):
+    def _compute_load_balance_loss(self, router_probs, experts_flat, f_i):
         """compute load balance loss within the expert groups"""
         p_i = router_probs.mean(dim=0).to(router_probs.dtype)
-
-        experts_flat = selected_experts.flatten()
-        f_i = torch.zeros(
-            self.num_experts, dtype=router_probs.dtype, device=router_probs.device
-        )
-        ones = torch.ones_like(experts_flat, dtype=router_probs.dtype) / len(
-            experts_flat
-        )
-        f_i.scatter_add_(0, experts_flat, ones)
 
         if len(set(self.expert_sizes)) == 1:
             # for uniform expert sizes, just compute regular lbl loss
@@ -515,7 +492,6 @@ class GPTConfig:
     num_experts_per_tok: int = 2
     norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1
     block_size: int = 128  # Triton kernel tile size for MoE
-    block_k: int = 64  # Triton kernel K dimension for MoE
     expert_sizes: Optional[list] = (
         None  # List of (count, size) tuples, e.g., [(1, 2048), (7, 1024)]
     )
@@ -983,7 +959,7 @@ class GPT(nn.Module):
                 else idx[:, -self.config.n_ctx :]
             )
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
