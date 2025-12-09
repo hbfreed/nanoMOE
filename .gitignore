@@ -26,3 +26,4 @@ domain_analysis.py
 variable_expert_analysis.py
 make_visualization_json.py
 moe.py
+variable_expert_analysis.ipynb
