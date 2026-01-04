@@ -4,13 +4,12 @@ For now, this implementation is based on [OLMoE](https://arxiv.org/pdf/2409.0206
 
 ![nanoMoE](assets/nanomoe.png)
 ## Goals
-- [X] Train an MoE nanoGPT on wikitext (Note: I originally had this as the shakespeare dataset, but all these models overfit so much that I opted for a bigger dataset in wikitext)
+- [X] Train an MoE nanoGPT on wikitext (Note: I originally had this as the shakespeare dataset, but all these models overfit so quickly that I opted for a bigger dataset in wikitext)
     - [X] Wikitext val loss < 3.6034 for ~ 13.77M active parameters
     - [X] Wikitext val loss ~= 3.6034 for < 13.77M active parameters
 - [X] Must not use [for loops over the experts](https://github.com/huggingface/transformers/blob/6017f5e8ed33d48096cdf8630d1cc7cbf2550c90/src/transformers/models/olmoe/modeling_olmoe.py#L598C1-L598C51)
-    - [X] Triton kernel version (Done, but it's slow)
-    - [ ] Megablocks version?
-- [ ] Train GPT-2 Size MoE on OWT/Fineweb (Stretch Goal if feeling frisky, probably would have to be ~125m *total*, would have to see how efficient we can really get to do ~125m active!)
+    - [X] Megablocks version
+- [X] Train GPT-2 Size MoE on OWT/Fineweb (125M active Moe chinchlla optimal ~2.5B tokens)
 
 ## Architecture Decisions
 Almost all of the architectural decisions are based off of the OLMoE paper.

@@ -40,36 +40,35 @@ class TopologyVarOp(torch.autograd.Function):
         Returns:
             Column indices for sparse topology matrix
         """
-        # Calculate total output size and cumulative offsets
-        # Each row gets expert_block_counts[expert_id] columns
-        # This is variable, so we need to sum across all experts
-        total_nnz = 0
-        output_offsets = [0]  # Cumulative offset for where each expert writes
+        # Calculate total output size and cumulative offsets using TENSOR OPS
+        # Avoids Python loop with .item() calls that cause GPU syncs
+        # (Reduces from 3N syncs to 1 sync for N experts)
 
-        for expert_id in range(expert_block_counts.numel()):
-            # How many token blocks does this expert get?
-            if expert_id == 0:
-                expert_token_blocks = padded_bins[0].item() // block_size
-            else:
-                expert_token_blocks = (
-                    padded_bins[expert_id].item() - padded_bins[expert_id - 1].item()
-                ) // block_size
-            # Each token block connects to all of this expert's FFN blocks
-            expert_output_size = (
-                expert_token_blocks * expert_block_counts[expert_id].item()
-            )
-            total_nnz += expert_output_size
-            output_offsets.append(output_offsets[-1] + expert_output_size)
+        # Compute token blocks per expert: diff of padded_bins / block_size
+        prepend = padded_bins.new_zeros(1)
+        bin_sizes = torch.diff(padded_bins, prepend=prepend)
+        expert_token_blocks = (bin_sizes // block_size).to(torch.int32)
+
+        # Compute output size per expert (token_blocks * expert_blocks)
+        expert_output_sizes = expert_token_blocks * expert_block_counts.to(torch.int32)
+
+        # Single sync to get total (unavoidable for allocation)
+        total_nnz = expert_output_sizes.sum().item()
+
+        if total_nnz == 0:
+            return torch.empty(0, dtype=torch.int16, device=padded_bins.device)
+
+        # Compute offsets on GPU - cumsum gives [a, a+b, a+b+c, ...], we need [0, a, a+b, ...]
+        cumsum = expert_output_sizes.cumsum(0)
+        output_offsets_tensor = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=padded_bins.device),
+            cumsum[:-1]
+        ]).to(torch.int32)
 
         out = torch.empty(
             total_nnz,
             dtype=torch.int16,
             device=padded_bins.device,
-        )
-
-        # Convert output_offsets to tensor (don't include the last element, kernel doesn't need it)
-        output_offsets_tensor = torch.tensor(
-            output_offsets[:-1], dtype=torch.int32, device=padded_bins.device
         )
 
         if ops is not None:

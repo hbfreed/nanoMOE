@@ -136,66 +136,41 @@ class MoeMLP(nn.Module):
 
         # Use block_size from config instead of hardcoded blocking
         self.block_size = config.block_size
-        base_d_ffn = 4 * self.n_embd // self.num_experts_per_tok
-        default_d_ffn = (
-            (base_d_ffn + self.block_size - 1) // self.block_size
-        ) * self.block_size
 
-        # Parse expert_sizes from config (list of (count, size) tuples)
-        expert_sizes_spec = getattr(config, "expert_sizes", None)
-        if expert_sizes_spec is not None:
-            # Build expert_sizes list from tuple specification
-            self.expert_sizes = []
-            for count, size in expert_sizes_spec:
-                # Round up to block_size multiple
-                size_rounded = (
-                    (size + self.block_size - 1) // self.block_size
-                ) * self.block_size
-                self.expert_sizes.extend([size_rounded] * count)
-
-            # Validate that counts match num_experts
-            if len(self.expert_sizes) != self.num_experts:
-                raise ValueError(
-                    f"expert_sizes specification produces {len(self.expert_sizes)} experts, "
-                    f"but config.num_experts={self.num_experts}"
-                )
-        else:
-            # Default: uniform sizing (backward compatible)
-            self.expert_sizes = [default_d_ffn] * self.num_experts
-
-        # Compute cumulative offsets for indexing into weight matrices
+        # expert_widths: FFN width for each expert, expanded from config.expert_sizes tuples
+        # e.g. config.expert_sizes=[(2, 1024), (1, 512)] -> expert_widths=[1024, 1024, 512]
+        self.expert_widths = []
         self.expert_offsets = [0]
-        for size in self.expert_sizes:
-            self.expert_offsets.append(self.expert_offsets[-1] + size)
+        for count, size in config.expert_sizes:
+            if size % self.block_size != 0:
+                raise ValueError(
+                    f"expert size {size} must be a multiple of block_size {self.block_size}"
+                )
+            for _ in range(count):
+                self.expert_widths.append(size)
+                self.expert_offsets.append(self.expert_offsets[-1] + size)
+
         self.total_expert_width = self.expert_offsets[-1]
+        self.expert_sizes = self.expert_widths  # Alias for notebook compatibility
 
-        self.d_ffn = self.expert_sizes[0]
+        self.d_ffn = self.expert_widths[0]
 
-        # Register buffers for efficient CUDA kernel access
-        self.register_buffer(
-            "expert_size_blocks",
-            torch.tensor(
-                [s // self.block_size for s in self.expert_sizes], dtype=torch.int32
-            ),
-            persistent=False,
+        self.expert_size_blocks = torch.tensor(
+            [s // self.block_size for s in self.expert_widths],
+            dtype=torch.int32,
         )
-        self.register_buffer(
-            "expert_block_offsets",
-            torch.tensor(
-                [o // self.block_size for o in self.expert_offsets], dtype=torch.int32
-            ),
-            persistent=False,
+        self.expert_block_offsets = torch.tensor(
+            [o // self.block_size for o in self.expert_offsets], dtype=torch.int32
         )
 
         # Pre-compute normalized expert sizes for compute loss (as a tensor for vectorized computation)
         # We use expert sizes as a proxy for compute cost (actual FLOPs = 2*n_embd*size, but constant cancels)
-        mean_expert_size = sum(self.expert_sizes) / self.num_experts
-        expert_sizes_normalized = torch.tensor(
-            [size / mean_expert_size for size in self.expert_sizes], dtype=torch.float32
+        mean_expert_width = sum(self.expert_widths) / self.num_experts
+        expert_widths_normalized = torch.tensor(
+            [w / mean_expert_width for w in self.expert_widths],
+            dtype=torch.float32,
         )
-        self.register_buffer(
-            "expert_sizes_normalized", expert_sizes_normalized, persistent=False
-        )
+        self.expert_widths_normalized = expert_widths_normalized
 
         self.router = nn.Linear(self.n_embd, self.num_experts, bias=False)
 
@@ -223,8 +198,11 @@ class MoeMLP(nn.Module):
 
         router_logits = self.router(x_flat)
 
-        router_probs = F.softmax(
-            router_logits, dim=-1, dtype=torch.float32
+        #router_probs = F.softmax(
+        #    router_logits, dim=-1, dtype=torch.float32
+        #)  # Use float32 for stability
+        router_probs = F.sigmoid(
+            router_logits
         )  # Use float32 for stability
 
         expert_weights, selected_experts = torch.topk(
@@ -290,11 +268,13 @@ class MoeMLP(nn.Module):
             seq_len=seq_len,
         )
 
-        # Compute weighted sum of normalized expert sizes (proportional to FLOPs)
-        # This is just: mean(router_probs @ expert_sizes_normalized)
-        # Cast expert_sizes_normalized to match router_probs dtype (could be bfloat16)
+        # Compute weighted sum of normalized expert widths (proportional to FLOPs)
+        # This is just: mean(router_probs @ expert_widths_normalized)
         compute_loss = (
-            router_probs_flat @ self.expert_sizes_normalized.to(router_probs_flat.dtype)
+            router_probs_flat
+            @ self.expert_widths_normalized.to(
+                router_probs_flat.device, router_probs_flat.dtype
+            )
         ).mean()
 
         aux_loss = {
@@ -322,11 +302,16 @@ class MoeMLP(nn.Module):
 
         block_rows = padded_tokens // self.block_size
 
+        # Move tensors to correct device (needed since we removed register_buffer)
+        device = padded_bins.device
+        expert_size_blocks = self.expert_size_blocks.to(device)
+        expert_block_offsets = self.expert_block_offsets.to(device)
+
         # Use variable-size topology with per-expert block counts
         column_indices = topology_var(
             padded_bins,
-            self.expert_size_blocks,  # Per-expert block counts
-            self.expert_block_offsets,  # Cumulative block offsets
+            expert_size_blocks,  # Per-expert block counts
+            expert_block_offsets,  # Cumulative block offsets
             self.block_size,
             block_rows,
         )
@@ -338,7 +323,7 @@ class MoeMLP(nn.Module):
 
         # Repeat each expert's size by how many token blocks it handles
         repeated_sizes = torch.repeat_interleave(
-            self.expert_size_blocks, expert_token_blocks
+            expert_size_blocks, expert_token_blocks
         )
 
         # Cumulative sum gives you offsets
@@ -425,9 +410,11 @@ class MoeMLP(nn.Module):
 
     def _compute_load_balance_loss(self, router_probs, experts_flat, f_i):
         """compute load balance loss within the expert groups"""
-        p_i = router_probs.mean(dim=0).to(router_probs.dtype)
+        p_i = router_probs.mean(dim=0)
+        # Ensure same dtype for dot product
+        f_i = f_i.to(p_i.dtype)
 
-        if len(set(self.expert_sizes)) == 1:
+        if len(set(self.expert_widths)) == 1:
             # for uniform expert sizes, just compute regular lbl loss
             return self.num_experts * (f_i @ p_i)
 
@@ -594,7 +581,7 @@ class GPT(nn.Module):
         # Get the first MoE layer to check for variable sizing
         moe_layer = None
         for module in self.modules():
-            if hasattr(module, "expert_sizes"):
+            if hasattr(module, "expert_widths"):
                 moe_layer = module
                 break
 
@@ -610,10 +597,10 @@ class GPT(nn.Module):
 
         # Calculate params per expert (for one layer)
         expert_params_per_layer = []
-        for expert_size in moe_layer.expert_sizes:
-            # w1: n_embd × expert_size, w2: expert_size × n_embd
-            w1_params = self.config.n_embd * expert_size
-            w2_params = expert_size * self.config.n_embd
+        for expert_width in moe_layer.expert_widths:
+            # w1: n_embd × expert_width, w2: expert_width × n_embd
+            w1_params = self.config.n_embd * expert_width
+            w2_params = expert_width * self.config.n_embd
             expert_params_per_layer.append(w1_params + w2_params)
 
         k = self.config.num_experts_per_tok
@@ -660,15 +647,15 @@ class GPT(nn.Module):
             "max_active": self.get_active_num_params(non_embedding, mode="max"),
         }
 
-        # Get expert sizes for reference
+        # Get expert widths for reference
         moe_layer = None
         for module in self.modules():
-            if hasattr(module, "expert_sizes"):
+            if hasattr(module, "expert_widths"):
                 moe_layer = module
                 break
 
         if moe_layer is not None:
-            stats["expert_sizes"] = moe_layer.expert_sizes
+            stats["expert_widths"] = moe_layer.expert_widths
             stats["num_experts"] = self.config.num_experts
             stats["experts_per_tok"] = self.config.num_experts_per_tok
 
@@ -1032,23 +1019,25 @@ class MoeMLPWithTracking(MoeMLP):
 
         router_z_loss = torch.logsumexp(router_logits, dim=-1).pow(2).mean()
 
-        p_i = router_probs.mean(dim=0).to(torch.bfloat16)
-
         experts_flat = selected_experts.flatten()
         f_i = torch.zeros(self.num_experts, dtype=x.dtype, device=x.device)
         ones = torch.ones_like(experts_flat, dtype=x.dtype) / len(experts_flat)
-        f_i.scatter_add(0, experts_flat, ones)
-        load_balance_loss = self.num_experts * (f_i @ p_i)
+        f_i.scatter_add_(0, experts_flat, ones)
+        load_balance_loss = self._compute_load_balance_loss(
+            router_probs, selected_experts_flat, f_i
+        )
 
         router_probs_flat = rearrange(
             router_probs, "(b s) e -> (b s) e", b=batch_size, s=seq_len
         )
 
-        # Compute weighted sum of normalized expert sizes (proportional to FLOPs)
-        # This is just: mean(router_probs @ expert_sizes_normalized)
-        # Cast expert_sizes_normalized to match router_probs dtype (could be bfloat16)
+        # Compute weighted sum of normalized expert widths (proportional to FLOPs)
+        # This is just: mean(router_probs @ expert_widths_normalized)
         compute_loss = (
-            router_probs_flat @ self.expert_sizes_normalized.to(router_probs_flat.dtype)
+            router_probs_flat
+            @ self.expert_widths_normalized.to(
+                router_probs_flat.device, router_probs_flat.dtype
+            )
         ).mean()
 
         expert_assignments = rearrange(
@@ -1099,6 +1088,7 @@ class GPTWithTracking(GPT):
 
         combined_aux_loss = {}
         all_expert_usage = []
+        expert_usage_per_layer = []  # Store per-layer expert usage like regular GPT
         all_expert_assignments = {}
         all_router_logits = {}
         all_router_probs = {}
@@ -1124,6 +1114,7 @@ class GPTWithTracking(GPT):
 
             if f_i is not None:
                 all_expert_usage.append(f_i)
+                expert_usage_per_layer.append(f_i.clone())
 
             all_expert_assignments[f"layer_{layer_idx}"] = aux_loss[
                 "expert_assignments"
@@ -1155,6 +1146,7 @@ class GPTWithTracking(GPT):
         if all_expert_usage:
             avg_expert_usage = torch.stack(all_expert_usage).mean(dim=0)
             combined_aux_loss["expert_usage"] = avg_expert_usage
+            combined_aux_loss["expert_usage_per_layer"] = expert_usage_per_layer
 
         combined_aux_loss["expert_assignments"] = all_expert_assignments
         combined_aux_loss["router_logits"] = all_router_logits
