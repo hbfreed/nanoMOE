@@ -188,7 +188,40 @@ class MoeMLP(nn.Module):
 
         self.transpose_sort_end_bit = max(int(np.ceil(np.log2(max_column_index))), 1)
 
-    @torch.compiler.disable
+        # Precompute tensors for vectorized load balance loss computation
+        # Use matrix multiplication instead of scatter_add for small expert counts
+        expert_to_group = []
+        group_sizes = []
+        valid_group_idx = 0
+        for count, size in config.expert_sizes:
+            for _ in range(count):
+                if count > 1:
+                    expert_to_group.append(valid_group_idx)
+                else:
+                    expert_to_group.append(-1)
+            if count > 1:
+                group_sizes.append(count)
+                valid_group_idx += 1
+
+        self._num_valid_groups = len(group_sizes)
+        self._all_experts_valid = all(g >= 0 for g in expert_to_group)
+
+        if self._num_valid_groups > 0:
+            # Build group membership matrix: [num_experts, num_groups]
+            group_membership = torch.zeros(self.num_experts, self._num_valid_groups)
+            for i, g in enumerate(expert_to_group):
+                if g >= 0:
+                    group_membership[i, g] = 1.0
+
+            self.register_buffer("group_membership", group_membership, persistent=False)
+            self.register_buffer("group_sizes_t", torch.tensor(group_sizes, dtype=torch.float32), persistent=False)
+            valid_indices = [i for i, g in enumerate(expert_to_group) if g >= 0]
+            self.register_buffer("valid_expert_indices", torch.tensor(valid_indices, dtype=torch.long), persistent=False)
+        else:
+            self.register_buffer("group_membership", torch.empty(0), persistent=False)
+            self.register_buffer("group_sizes_t", torch.tensor([1.0]), persistent=False)
+            self.register_buffer("valid_expert_indices", torch.empty(0, dtype=torch.long), persistent=False)
+
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
 
@@ -407,33 +440,31 @@ class MoeMLP(nn.Module):
         )
 
     def _compute_load_balance_loss(self, router_probs, experts_flat, f_i):
-        """compute load balance loss within the expert groups"""
+        """Compute load balance loss within expert groups (vectorized)."""
         p_i = router_probs.mean(dim=0)
-        # Ensure same dtype for dot product
-        f_i = f_i.to(p_i.dtype)
 
+        # Fast path for uniform expert sizes
         if len(set(self.expert_widths)) == 1:
-            # for uniform expert sizes, just compute regular lbl loss
-            return self.num_experts * (f_i @ p_i)
+            return self.num_experts * (f_i.float() @ p_i.float())
 
-        expert_sizes_spec = getattr(self.config, "expert_sizes", None)
-        if expert_sizes_spec is None:
-            return self.num_experts * (f_i @ p_i)
+        # Fast path if no valid groups
+        if self._num_valid_groups == 0:
+            return f_i.float() @ p_i.float()
 
-        group_losses = []
-        expert_idx = 0
-        for count, size in expert_sizes_spec:
-            group_indices = list(range(expert_idx, expert_idx + count))
-            expert_idx += count
+        # Compute f_i * p_i elementwise
+        fi_pi = f_i.float() * p_i.float()
 
-            if count > 1:
-                group_f_i = f_i[group_indices]
-                group_p_i = p_i[group_indices]
+        # If all experts are in valid groups, skip masking
+        membership = self.group_membership.to(fi_pi.dtype)
+        if self._all_experts_valid:
+            group_sums = fi_pi @ membership
+        else:
+            fi_pi_valid = fi_pi.index_select(0, self.valid_expert_indices)
+            membership_valid = membership.index_select(0, self.valid_expert_indices)
+            group_sums = fi_pi_valid @ membership_valid
 
-                group_loss = count * (group_f_i @ group_p_i)
-                group_losses.append(group_loss)
-
-        return sum(group_losses) / len(group_losses) if group_losses else f_i @ p_i
+        group_losses = self.group_sizes_t.to(fi_pi.dtype) * group_sums
+        return group_losses.mean()
 
 
 class Block(nn.Module):
@@ -969,7 +1000,6 @@ MoeMLPWithTracking and GPTWithTracking are the same as MoeMLP and GPT, but with 
 class MoeMLPWithTracking(MoeMLP):
     """Add expert assignment tracking to the mlp layer's forward pass"""
 
-    @torch.compiler.disable
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
 
