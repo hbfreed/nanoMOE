@@ -474,7 +474,19 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if config.use_moe:
-            self.mlp = MoeMLP(config)
+            if config.use_triton_moe:
+                from triton_moe import TritonMoEMLP, TritonMoEConfig
+
+                tri_config = TritonMoEConfig(
+                    n_embd=config.n_embd,
+                    expert_sizes=config.expert_sizes,
+                    num_active_experts=config.num_experts_per_tok,
+                    norm_topk_prob=config.norm_topk_prob,
+                    block_size=config.block_size,
+                )
+                self.mlp = TritonMoEMLP(tri_config)
+            else:
+                self.mlp = MoeMLP(config)
         else:
             self.mlp = MLP(config)
 
@@ -504,6 +516,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     use_moe: bool = False
+    use_triton_moe: bool = True  # Use Triton kernels instead of stk (requires triton-variable-moe)
     num_experts: int = 8
     num_experts_per_tok: int = 2
     norm_topk_prob: bool = True  # Normalize top-k router probabilities to sum to 1

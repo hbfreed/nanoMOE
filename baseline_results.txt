@@ -1,0 +1,39 @@
+======================================================================
+Topology Variable Expert Benchmark
+======================================================================
+Config: n_ctx=1024, dtype=bfloat16, compile=False
+MoE: 8 experts (4x2944 + 4x128), top-2 routing
+Warmup: 5 iters, Benchmark: 10 iters
+======================================================================
+
+Testing batch_size=4... number of parameters: 293.53M
+active parameters per token (expected): 123.66M
+  range: 71.76M (min) to 175.57M (max)
+num decayed parameter tensors: 62, with 294,297,600 parameters
+num non-decayed parameter tensors: 25, with 19,200 parameters
+using fused AdamW: True
+done (144.39ms/iter)
+Testing batch_size=8... number of parameters: 293.53M
+active parameters per token (expected): 123.66M
+  range: 71.76M (min) to 175.57M (max)
+num decayed parameter tensors: 62, with 294,297,600 parameters
+num non-decayed parameter tensors: 25, with 19,200 parameters
+using fused AdamW: True
+done (201.69ms/iter)
+Testing batch_size=12... number of parameters: 293.53M
+active parameters per token (expected): 123.66M
+  range: 71.76M (min) to 175.57M (max)
+num decayed parameter tensors: 62, with 294,297,600 parameters
+num non-decayed parameter tensors: 25, with 19,200 parameters
+using fused AdamW: True
+done (267.16ms/iter)
+
+======================================================================
+Results Summary
+======================================================================
+ Batch |  Time/Iter (ms) |  Peak Mem (GB) |    MFU (%)
+----------------------------------------------------------------------
+     4 |          144.39 |           8.52 |      34.17
+     8 |          201.69 |          12.04 |      48.92
+    12 |          267.16 |          15.51 |      55.40
+======================================================================
